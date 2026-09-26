@@ -344,6 +344,12 @@ def run(model_path: Path, root: Path) -> Checks:
         checks.check(f"C4 dense-only row {s1}->{target} reaches the features intact", ok,
                      f"blocker_dense={feature['blocker_dense'].iloc[0] if len(feature) else '-'} "
                      f"dense_cosine={feature['dense_cosine'].iloc[0] if len(feature) else '-'}")
+        # V2 context: the cross-script pair is its S1's best dense candidate - the
+        # signal that lets a model accept a 0.69 cosine a global cut would reject.
+        rank = feature["s1ctx_dense_cosine_rank"].iloc[0] if len(feature) else ""
+        gap = feature["s1ctx_dense_cosine_gap_to_best"].iloc[0] if len(feature) else ""
+        checks.check(f"V2 {s1}->{target} is its S1's top dense candidate (s1ctx rank 1, gap 0)",
+                     rank != "" and float(rank) == 1.0 and float(gap) == 0.0, f"rank={rank} gap={gap}")
 
     # ...and through scoring and the writer: with the threshold set just below the
     # cross-script cosines (a PLUMBING check - the value is derived from the
@@ -362,10 +368,23 @@ def run(model_path: Path, root: Path) -> Checks:
                  f"{UNIQUE_NAME_SINGLETON} -> {plumbing_rows.get(UNIQUE_NAME_SINGLETON)!r}, "
                  f"{NO_CANDIDATE_SINGLETON} -> {plumbing_rows.get(NO_CANDIDATE_SINGLETON)!r}")
 
+    # V2 conflicts: no target is ever written for two S1 entities.
+    for label, table in (("tuned", rows), ("override", plumbing_rows)):
+        owners: dict[str, list[str]] = {}
+        for s1, joined in table.items():
+            for target in filter(None, joined.split(",")):
+                owners.setdefault(target, []).append(s1)
+        shared = {t: s for t, s in owners.items() if len(s) > 1}
+        checks.check(f"V2 no target written for two S1 entities ({label} submission)", not shared,
+                     f"shared={shared}" if shared else f"{len(owners)} targets, each with one S1")
+
     report = json.loads((work / "submission" / "train_matching_results_report.json").read_text(encoding="utf-8"))
     model_meta = json.loads((work / "experiments" / "v1" / "model" / "model_meta.json").read_text(encoding="utf-8"))
-    checks.check("train dry run scored end to end", "score_all" in report,
-                 f"train macro F0.5 (score_zero)={report['score_all']['macro_f05_score_zero']:.4f}")
+    comparison = report["target_conflicts"]["comparison"]
+    checks.check("train dry run scored end to end, both conflict modes", "score_all" in report and len(comparison) == 2,
+                 f"train macro F0.5 (score_zero) keep-best={comparison['keep-best']['all']:.4f} "
+                 f"off={comparison['off']['all']:.4f}; GT targets with >1 S1="
+                 f"{report['target_conflicts']['ground_truth']['targets_with_multiple_s1']}")
 
     # Diagnostic, deliberately NOT a pass/fail check: whether the *tuned* one-feature
     # baseline admits the cross-script pairs is a model-quality property of a handful

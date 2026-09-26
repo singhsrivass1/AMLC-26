@@ -169,11 +169,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
-# The 29 model features, in the order ``scripts/extract_pair_features.py`` writes
+# The 41 model features, in the order ``scripts/extract_pair_features.py`` writes
 # them (its FEATURE_DTYPES minus NON_FEATURE_COLUMNS). ``dense_cosine`` and
 # ``blocker_dense`` carry the dense blocker's evidence: without them a dense-only
 # (e.g. cross-script) pair would be judged on lexical features alone, which are ~0
-# for it by construction, and rejected. Kept here as a tuple rather
+# for it by construction, and rejected. The twelve ``s1ctx_*`` columns (V2) place
+# each candidate within its S1's candidate group. Kept here as a tuple rather
 # than imported from the script - ``src`` does not import from ``scripts`` - and
 # checked against the feature file's own header at read time by
 # ``resolve_feature_columns``, so a change on either side fails loudly instead of
@@ -208,6 +209,18 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "source_is_s2",
     "country_equal",
     "country_missing",
+    "s1ctx_name_token_set_ratio_rank",
+    "s1ctx_name_token_set_ratio_gap_to_best",
+    "s1ctx_name_token_set_ratio_ratio_to_max",
+    "s1ctx_name_token_set_ratio_ratio_to_mean",
+    "s1ctx_name_char3_jaccard_rank",
+    "s1ctx_name_char3_jaccard_gap_to_best",
+    "s1ctx_name_char3_jaccard_ratio_to_max",
+    "s1ctx_name_char3_jaccard_ratio_to_mean",
+    "s1ctx_dense_cosine_rank",
+    "s1ctx_dense_cosine_gap_to_best",
+    "s1ctx_dense_cosine_ratio_to_max",
+    "s1ctx_dense_cosine_ratio_to_mean",
 )
 
 # dtypes to parse those columns with, mirrored from the extractor. Reading them as
@@ -242,6 +255,18 @@ FEATURE_DTYPES: dict[str, str] = {
     "source_is_s2": "uint8",
     "country_equal": "uint8",
     "country_missing": "uint8",
+    "s1ctx_name_token_set_ratio_rank": "float32",
+    "s1ctx_name_token_set_ratio_gap_to_best": "float32",
+    "s1ctx_name_token_set_ratio_ratio_to_max": "float32",
+    "s1ctx_name_token_set_ratio_ratio_to_mean": "float32",
+    "s1ctx_name_char3_jaccard_rank": "float32",
+    "s1ctx_name_char3_jaccard_gap_to_best": "float32",
+    "s1ctx_name_char3_jaccard_ratio_to_max": "float32",
+    "s1ctx_name_char3_jaccard_ratio_to_mean": "float32",
+    "s1ctx_dense_cosine_rank": "float32",
+    "s1ctx_dense_cosine_gap_to_best": "float32",
+    "s1ctx_dense_cosine_ratio_to_max": "float32",
+    "s1ctx_dense_cosine_ratio_to_mean": "float32",
 }
 
 # Id / provenance columns carried by the feature file. Never features: they identify

@@ -120,6 +120,114 @@ def load_s1_universe(config: dict, split: str, log: Optional[logging.Logger] = N
 
 
 # ---------------------------------------------------------------------------
+# Target conflicts: one S2/S3 record, several S1 claimants
+# ---------------------------------------------------------------------------
+def resolve_target_conflicts(
+    s1_ids: Sequence[str],
+    target_ids: Sequence[str],
+    scores: Sequence[float],
+    s1_order: Mapping[str, int],
+) -> tuple[np.ndarray, dict]:
+    """Keep every target for its single highest-scoring S1; drop its other claims.
+
+    S1 is the *deduplicated* reference list, so a noisy S2/S3 record describes at
+    most one S1 business. When the thresholded predictions give the same target to
+    several S1 entities, all but one of those claims is a false positive - and under
+    F0.5 a false positive costs four times a false negative. The claim kept is the
+    one with the highest score; an exact tie goes to the S1 that comes first in S1
+    file order, so the result is deterministic.
+
+    The one-S1-per-target premise is an assumption about the data. Check it with
+    :func:`ground_truth_target_multiplicity` before relying on this, and compare the
+    dry-run score with and without resolution (``predict.py --split train`` does both).
+
+    Args:
+        s1_ids, target_ids, scores: the predicted pairs (row-aligned). A duplicated
+            ``(s1, target)`` pair counts once, at its highest score.
+        s1_order: S1 id -> position in S1 file order (the tie-break).
+
+    Returns:
+        ``(keep, stats)``: a boolean mask over the input rows, and counts of what
+        the resolution did.
+    """
+    s1 = np.asarray(s1_ids, dtype=object)
+    targets = np.asarray(target_ids, dtype=object)
+    score = np.asarray(scores, dtype=np.float64)
+    n = len(targets)
+    if not (len(s1) == n == len(score)):
+        raise ValueError("s1_ids, target_ids and scores must be row-aligned")
+    stats = {
+        "pairs_in": n,
+        "targets": 0,
+        "targets_with_conflicts": 0,
+        "pairs_dropped": 0,
+        "tied_best_scores": 0,
+        "s1_left_without_matches": 0,
+    }
+    keep = np.zeros(n, dtype=bool)
+    if n == 0:
+        return keep, stats
+    if np.isnan(score).any():
+        raise ValueError("scores must not be NaN")
+
+    target_codes, target_uniques = pd.factorize(targets, sort=False)
+    s1_rank = np.fromiter((s1_order[value] for value in s1), dtype=np.int64, count=n)
+    # Primary key target, then score descending, then S1 file order.
+    order = np.lexsort((s1_rank, -score, target_codes))
+    sorted_codes = target_codes[order]
+    first = np.ones(n, dtype=bool)
+    first[1:] = sorted_codes[1:] != sorted_codes[:-1]
+    keep[order[first]] = True
+
+    # A pair duplicated in the input would count as a conflict with itself; it is
+    # not one, so claimants are counted as distinct S1 ids per target.
+    distinct = pd.DataFrame({"t": target_codes, "s": s1}).drop_duplicates()
+    claimants = np.bincount(distinct["t"].to_numpy(), minlength=len(target_uniques))
+    runner_up = np.zeros(n, dtype=bool)
+    runner_up[1:] = first[:-1] & ~first[1:]  # second row of a target's block
+    sorted_scores, sorted_s1 = score[order], s1[order]
+    tied = runner_up.copy()
+    tied[runner_up] = (sorted_scores[np.flatnonzero(runner_up) - 1] == sorted_scores[runner_up]) & (
+        sorted_s1[np.flatnonzero(runner_up) - 1] != sorted_s1[runner_up]
+    )
+    stats.update(
+        {
+            "targets": int(len(target_uniques)),
+            "targets_with_conflicts": int((claimants > 1).sum()),
+            "pairs_dropped": int((~keep).sum()),
+            "tied_best_scores": int(tied.sum()),
+            "s1_left_without_matches": int(len(set(s1) - set(s1[keep]))),
+        }
+    )
+    return keep, stats
+
+
+def group_matches(s1_ids: Sequence[str], target_ids: Sequence[str]) -> dict[str, set[str]]:
+    """``{s1: {targets}}`` from row-aligned predicted pairs (the writer's input)."""
+    grouped: dict[str, set[str]] = {}
+    for s1, target in zip(s1_ids, target_ids):
+        grouped.setdefault(s1, set()).add(target)
+    return grouped
+
+
+def ground_truth_target_multiplicity(ground_truth: GroundTruth) -> dict:
+    """How often one target id is a true match of several S1 entities.
+
+    The premise of :func:`resolve_target_conflicts` is that this is (almost) never
+    the case. ``targets_with_multiple_s1 == 0`` means resolution can only remove
+    false positives; anything above 0 is the number of true pairs it may delete.
+    """
+    codes, counts = np.unique(ground_truth.codes, return_counts=True)
+    multi = counts > 1
+    return {
+        "distinct_targets": int(len(codes)),
+        "targets_with_multiple_s1": int(multi.sum()),
+        "true_pairs_on_shared_targets": int(counts[multi].sum()),
+        "max_s1_per_target": int(counts.max()) if len(counts) else 0,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Writing
 # ---------------------------------------------------------------------------
 def write_submission(

@@ -227,9 +227,36 @@ FEATURE_DTYPES: dict[str, str] = {
     "source_is_s2": "uint8",
     "country_equal": "uint8",
     "country_missing": "uint8",
+    # -- per-S1 context (V2): where this candidate stands among its S1's candidates.
+    # rank: 1 = best in the group (ties share the best rank); gap: group best minus
+    # this value; ratio_to_max / ratio_to_mean: this value over the group max / mean.
+    # NaN where the base value is missing (e.g. dense did not propose the pair).
+    "s1ctx_name_token_set_ratio_rank": "float32",
+    "s1ctx_name_token_set_ratio_gap_to_best": "float32",
+    "s1ctx_name_token_set_ratio_ratio_to_max": "float32",
+    "s1ctx_name_token_set_ratio_ratio_to_mean": "float32",
+    "s1ctx_name_char3_jaccard_rank": "float32",
+    "s1ctx_name_char3_jaccard_gap_to_best": "float32",
+    "s1ctx_name_char3_jaccard_ratio_to_max": "float32",
+    "s1ctx_name_char3_jaccard_ratio_to_mean": "float32",
+    "s1ctx_dense_cosine_rank": "float32",
+    "s1ctx_dense_cosine_gap_to_best": "float32",
+    "s1ctx_dense_cosine_ratio_to_max": "float32",
+    "s1ctx_dense_cosine_ratio_to_mean": "float32",
     # -- integrity, not a feature --
     "text_join_ok": "uint8",
 }
+
+# The base scores the per-S1 context features describe. At extraction time there is
+# no model score yet, so the context is taken over the three strongest single-pair
+# similarities: the lexical name score, the char-3-gram score, and the dense cosine.
+# Each is a pure function of the candidate file plus the prepared text - no label is
+# read - so the context features are as leak-free as the pair features themselves.
+S1_CONTEXT_BASES = ("name_token_set_ratio", "name_char3_jaccard", "dense_cosine")
+S1_CONTEXT_STATS = ("rank", "gap_to_best", "ratio_to_max", "ratio_to_mean")
+S1_CONTEXT_FEATURES = tuple(
+    f"s1ctx_{base}_{stat}" for base in S1_CONTEXT_BASES for stat in S1_CONTEXT_STATS
+)
 
 # Columns present in the written matrix that are NOT features and must be dropped
 # before training. They are written so a failed join stays diagnosable per row, but
@@ -346,6 +373,67 @@ def parse_provenance(text: str) -> tuple[int, int, int, int, int, int]:
             else:
                 unknown += 1
     return exact, token, char, dense, exact + token + char + dense, unknown
+
+
+def add_s1_context_features(features: pd.DataFrame, s1_ids: np.ndarray) -> None:
+    """Add the per-S1 context columns to ``features`` in place.
+
+    For each base score in :data:`S1_CONTEXT_BASES`, over the candidate rows of the
+    same S1 entity:
+
+    * ``rank``          1 for the group's best value, ties sharing the best rank
+                        (``method="min"``), so "is the top candidate" is ``rank == 1``;
+    * ``gap_to_best``   group max minus this value (0 for the best candidate);
+    * ``ratio_to_max``  this value / group max (NaN when the max is not positive);
+    * ``ratio_to_mean`` this value / group mean (NaN when the mean is not positive).
+
+    Why these help a per-entity macro F0.5: a pair-level model scores "acme holdings"
+    vs "acme holding" the same whether it is the S1's only plausible candidate or the
+    runner-up behind an exact match. The context tells it which.
+
+    Missing base values (NaN - e.g. ``dense_cosine`` on a pair dense did not propose,
+    or a name score on a failed join) are excluded from the group statistics and get
+    NaN context, never a fabricated rank. The result depends only on the multiset of
+    rows in each group, so it is independent of row order and batching - provided
+    the frame holds every row of each S1 it contains (see :func:`iter_entity_batches`).
+    """
+    keys = pd.Series(s1_ids, index=features.index)
+    for base in S1_CONTEXT_BASES:
+        values = features[base].astype("float64")
+        grouped = values.groupby(keys, sort=False)
+        best = grouped.transform("max")
+        mean = grouped.transform("mean")
+        features[f"s1ctx_{base}_rank"] = grouped.rank(method="min", ascending=False)
+        features[f"s1ctx_{base}_gap_to_best"] = best - values
+        features[f"s1ctx_{base}_ratio_to_max"] = values / best.where(best > 0)
+        features[f"s1ctx_{base}_ratio_to_mean"] = values / mean.where(mean > 0)
+
+
+def iter_entity_batches(
+    path: Path, batch_size: int, columns: Optional[Sequence[str]] = None
+):
+    """Stream a candidate/sample TSV in batches that never split an S1 group.
+
+    Rows of one S1 are contiguous in every file this script reads (the generator
+    writes each entity's block contiguously, and the sample and the shards preserve
+    that order), so a batch is cut at the last entity boundary and the trailing
+    group is carried into the next batch. Row order is untouched, so the output is
+    byte-identical to plain fixed-size batching; only the cut points move. A group
+    larger than ``batch_size`` simply makes one batch larger.
+    """
+    carry: Optional[pd.DataFrame] = None
+    for chunk in iter_tsv(path, columns=columns, chunksize=max(1, int(batch_size))):
+        frame = chunk if carry is None else pd.concat([carry, chunk], ignore_index=True)
+        ids = frame[CANDIDATE_S1_COLUMN].to_numpy(dtype=object)
+        other = np.flatnonzero(ids != ids[-1])
+        if other.size == 0:
+            carry = frame  # one group so far; keep reading until it ends
+            continue
+        cut = int(other[-1]) + 1
+        carry = frame.iloc[cut:].reset_index(drop=True)
+        yield frame.iloc[:cut]
+    if carry is not None and len(carry):
+        yield carry
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +834,9 @@ def _seed_integrity() -> dict[str, int]:
         "unknown_source_labels": 0,
         "unknown_blocker_labels": 0,
         "missing_s1_counts": 0,
+        # S1 groups whose rows were not all in one batch when their context features
+        # were computed. Must be 0; main() fails the run otherwise.
+        "s1_context_partial_groups": 0,
         "rapidfuzz_available": 0,
     }
     for column in EVIDENCE_FLOAT_COLUMNS:
@@ -993,6 +1084,19 @@ def build_features(
             else:
                 features.loc[failed, column] = 0
 
+    # After the blanking, so a failed-join row is missing from its group's statistics
+    # rather than counted as a 0 score. Needs every row of each S1 in this frame:
+    # callers batch with iter_entity_batches, and a group that is incomplete here is
+    # counted (and fails the run) instead of silently producing wrong context.
+    add_s1_context_features(features, s1_ids)
+    group_codes, group_ids = pd.factorize(s1_ids, sort=False)
+    group_sizes = np.bincount(group_codes, minlength=len(group_ids))
+    expected = np.fromiter((counts.get(e, -1) for e in group_ids), dtype=np.int64, count=len(group_ids))
+    _bump(integrity, "s1_context_partial_groups", int(((expected >= 0) & (expected != group_sizes)).sum()))
+
+    # Columns in declaration order: the context columns were appended last, but the
+    # file contract (and the matcher's schema check) is FEATURE_DTYPES order.
+    features = features[list(FEATURE_DTYPES)]
     for column, dtype in FEATURE_DTYPES.items():
         features[column] = features[column].astype(dtype)
 
@@ -1162,7 +1266,7 @@ def _extract_features_single(
     started = time.time()
     with ChunkWriter(feature_path) as writer:
         for batch_index, frame in enumerate(
-            iter_tsv(scan["sample_path"], chunksize=args.feature_batch_size), start=1
+            iter_entity_batches(scan["sample_path"], args.feature_batch_size), start=1
         ):
             features = build_features(frame, lookups, s1_lookup, counts, integrity)
             # Independent re-count of the sampled rows, to prove the whole-entity
@@ -1483,7 +1587,7 @@ def _feature_worker(payload: dict[str, Any]) -> dict[str, Any]:
     sample_counts: dict[str, int] = {}
     started = time.time()
     with ChunkWriter(feature_path) as writer:
-        for batch_index, frame in enumerate(iter_tsv(shard_path, chunksize=batch_size), start=1):
+        for batch_index, frame in enumerate(iter_entity_batches(shard_path, batch_size), start=1):
             features = build_features(frame, lookups, s1_lookup, worker_counts, integrity)
             batch_codes, batch_ids = pd.factorize(
                 frame[CANDIDATE_S1_COLUMN].to_numpy(dtype=object), sort=False
@@ -2216,6 +2320,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log.error("unit-interval features outside [0, 1]: %s", features["out_of_range"])
         return 1
     if features["integrity"].get("count_mismatches"):
+        return 1
+    if features["integrity"].get("s1_context_partial_groups"):
+        log.error(
+            "%s S1 groups were split across feature batches: their per-S1 context "
+            "features are wrong (is the candidate file grouped by S1?)",
+            fmt_int(features["integrity"]["s1_context_partial_groups"]),
+        )
         return 1
     if features["integrity"].get("dtype_mismatches"):
         log.error("worker output dtypes differ from the declaration: %s",
