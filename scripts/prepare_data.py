@@ -36,9 +36,11 @@ from src.data_loader import (  # noqa: E402
     SOURCE_PREFIX,
     SOURCES,
     SPLITS,
+    TSV_DIALECT,
     ChunkWriter,
     assign_splits,
     check_data_available,
+    count_data_lines,
     describe_environment,
     load_config,
     prepared_path,
@@ -54,6 +56,7 @@ from src.utils import (  # noqa: E402
     ensure_dir,
     fmt_int,
     log_memory,
+    read_json,
     set_seed,
     setup_logging,
     track,
@@ -61,6 +64,62 @@ from src.utils import (  # noqa: E402
 )
 
 LOG_NAME = "prepare_data"
+
+
+def sidecar_path(output_path: Path) -> Path:
+    """Provenance record written next to every prepared table."""
+    return output_path.with_name(output_path.name + ".meta.json")
+
+
+def expected_provenance(config: dict, split: str, source: str, normalizer: Normalizer, limit: int | None) -> dict:
+    """Everything that decides a prepared table's content, for this request.
+
+    A prepared table is reused only when its recorded provenance equals this. The
+    row ``limit`` is the field that matters most: without it a ``--limit 100000``
+    smoke table is indistinguishable from a full one, and the full run that follows
+    the README's smoke test would silently use 100k rows.
+    """
+    input_path = raw_path(config, split, source)
+    stat = input_path.stat()
+    split_section = config.get("evaluation", {}).get("split", {}) or {}
+    return {
+        "limit": int(limit) if limit else None,
+        "tsv_dialect": TSV_DIALECT,
+        "normalization": {
+            "unicode_form": normalizer.unicode_form,
+            "fold_latin_accents": normalizer.fold_latin_accents,
+            "case_mode": normalizer.case_mode,
+            "punctuation_to_space": normalizer.punctuation_to_space,
+            "max_length": normalizer.max_length,
+        },
+        "raw": {"file": input_path.name, "size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)},
+        # The split column depends on these, so they are part of the S1 table's identity.
+        "split": (
+            {
+                "val_fraction": split_section.get("val_fraction", 0.2),
+                "mode": split_section.get("mode", "hash"),
+                "seed": config.get("project", {}).get("seed", 42),
+            }
+            if source == "source1" and split == "train"
+            else None
+        ),
+    }
+
+
+def reuse_problems(output_path: Path, expected: dict) -> list[str]:
+    """Why an existing prepared table cannot be reused; empty means it can."""
+    record_path = sidecar_path(output_path)
+    if not record_path.is_file():
+        return ["no provenance record (written before provenance tracking, or by a crashed run)"]
+    try:
+        recorded = read_json(record_path).get("request", {})
+    except Exception:  # noqa: BLE001 - a corrupt record is simply not trusted
+        return ["unreadable provenance record"]
+    return [
+        f"{key}: recorded {recorded.get(key)!r} != requested {value!r}"
+        for key, value in expected.items()
+        if recorded.get(key) != value
+    ]
 
 
 def prepare_one(
@@ -71,6 +130,7 @@ def prepare_one(
     limit: int | None,
     overwrite: bool,
     log,
+    allow_row_loss: bool = False,
 ) -> dict:
     """Normalize one source of one split. Returns a stats dict."""
     from src.data_loader import iter_tsv  # local import: keeps module import light
@@ -83,11 +143,21 @@ def prepare_one(
 
     input_path = raw_path(config, split, source)
     output_path = prepared_path(config, split, source)
+    expected = expected_provenance(config, split, source, normalizer, limit)
 
     if output_path.is_file() and not overwrite:
-        existing = _count_output_rows(output_path)
-        log.info("%s/%s already prepared (%s rows) - skipping (use --overwrite)", split, source, fmt_int(existing))
-        return {"split": split, "source": source, "rows": existing, "skipped": True, "output": str(output_path)}
+        problems = reuse_problems(output_path, expected)
+        if not problems:
+            existing = _count_output_rows(output_path)
+            log.info("%s/%s already prepared (%s rows) - skipping (use --overwrite)", split, source, fmt_int(existing))
+            return {"split": split, "source": source, "rows": existing, "skipped": True, "output": str(output_path)}
+        log.warning(
+            "%s/%s: existing %s cannot be reused (%s) - re-preparing",
+            split,
+            source,
+            output_path.name,
+            "; ".join(problems),
+        )
 
     chunksize = config.get("io", {}).get("chunksize", 500_000)
     if limit:
@@ -158,7 +228,29 @@ def prepare_one(
         raise RuntimeError(
             f"integrity check failed for {split}/{source}: wrote {rows_out} rows, file has {written_rows}"
         )
+
+    # Verify the parser read every record of the raw file. Under strict TSV one
+    # non-blank line is one record, so a mismatch means rows were merged or dropped
+    # (on_bad_lines only warns). A lost S1 row is a missing submission row; a lost
+    # target row is lost recall - neither may pass silently.
+    raw_lines = None
+    if not limit:
+        raw_lines = count_data_lines(input_path)
+        if raw_lines != rows_in:
+            message = (
+                f"{split}/{source}: raw file has {fmt_int(raw_lines)} data lines but the parser "
+                f"read {fmt_int(rows_in)} rows - rows were merged or dropped (check for "
+                f"malformed lines / stray tabs in {input_path.name})"
+            )
+            if not allow_row_loss:
+                partial_path.unlink(missing_ok=True)
+                raise RuntimeError(message + "; rerun with --allow-row-loss to accept this")
+            log.error("%s (accepted: --allow-row-loss)", message)
     partial_path.replace(output_path)
+    write_json(
+        sidecar_path(output_path),
+        {"request": expected, "rows": int(rows_out), "raw_data_lines": raw_lines},
+    )
 
     stats = {
         "split": split,
@@ -212,7 +304,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sources", default=",".join(SOURCES), help="comma-separated source names")
     parser.add_argument("--limit", type=int, default=None, help="max rows per source (smoke tests)")
     parser.add_argument("--chunksize", type=int, default=None, help="override io.chunksize")
-    parser.add_argument("--overwrite", action="store_true", help="re-prepare even if output exists")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="re-prepare even if a matching output exists (a mismatching one - other "
+        "--limit, normalization or raw file - is always re-prepared)",
+    )
+    parser.add_argument(
+        "--allow-row-loss",
+        action="store_true",
+        help="accept a raw file whose physical line count differs from the parsed row "
+        "count (logged as an error instead of failing the run)",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -272,7 +375,18 @@ def main(argv: list[str] | None = None) -> int:
                 log.error("unknown source %r; expected one of %s", source, SOURCES)
                 return 2
             try:
-                all_stats.append(prepare_one(config, split, source, normalizer, args.limit, args.overwrite, log))
+                all_stats.append(
+                    prepare_one(
+                        config,
+                        split,
+                        source,
+                        normalizer,
+                        args.limit,
+                        args.overwrite,
+                        log,
+                        allow_row_loss=args.allow_row_loss,
+                    )
+                )
             except Exception:
                 log.exception("failed preparing %s/%s", split, source)
                 return 1

@@ -68,11 +68,15 @@ from src.blocking import (  # noqa: E402
     BLOCKER_CHAR_NGRAM,
     BLOCKER_EXACT_NAME,
     BLOCKER_TOKEN,
+    LEXICAL_BLOCKERS,
     PAIR_MULTIPLIER,
-    UNION_BLOCKERS,
     _trigram_jaccard,
     resolve_blocker_settings,
 )
+
+# This analysis is defined over the three lexical generators (its combination
+# bitmask and the "all_three" label are). The dense blocker is not part of it.
+UNION_BLOCKERS = LEXICAL_BLOCKERS
 from src.data_loader import (  # noqa: E402
     GroundTruth,
     candidates_path,

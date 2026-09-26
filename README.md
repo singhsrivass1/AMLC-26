@@ -8,7 +8,7 @@ trillion), so the pipeline is built around **blocking**: only pairs that share a
 key are ever compared. This repository currently implements the infrastructure
 and the first blocker (exact normalized name) plus full blocking evaluation.
 
-**Status: milestone 1 of 3.** See [Roadmap](#roadmap).
+**Status: blocking, matcher V1 and the submission path are implemented; the dense blocker is implemented but not yet calibrated.** See [Roadmap](#roadmap).
 
 ---
 
@@ -86,15 +86,19 @@ reachable operating point at an acceptable candidate volume. See
 │   ├── blocking.py                 # inverted index + blocker union
 │   ├── evaluation.py               # blocking metrics + per-entity F0.5
 │   ├── utils.py                    # logging, progress, hashing, id codec, device
-│   ├── features.py                 # milestone 2 (stub)
-│   └── matching_model.py           # milestone 2 (stub)
+│   ├── submission.py               # matching_results.tsv: write, validate, score
+│   ├── features.py                 # stub - features live in scripts/extract_pair_features.py
+│   └── matching_model.py           # V1 LightGBM matcher + threshold sweep
 ├── scripts/                        # CLI entry points for heavy work
 │   ├── prepare_data.py             # stage 1
-│   ├── build_indexes.py            # stage 2
+│   ├── build_indexes.py            # stage 2 (every blocker enabled in config)
 │   ├── generate_candidates.py      # stage 3
 │   ├── evaluate_blocking.py        # stage 4
-│   ├── train_model.py              # stage 5 (milestone 2 - stub)
-│   └── predict.py                  # stage 6 (milestone 2 - stub)
+│   ├── extract_pair_features.py    # stage 4b: pair features
+│   ├── train_model.py              # stage 5: V1 matcher
+│   ├── predict.py                  # stage 6: matching_results.tsv
+│   ├── score_submission.py         # validate / score a submission
+│   └── fetch_dense_model.py        # one-time bge-m3 download (login node)
 ├── outputs/                        # generated (gitignored)
 └── logs/                           # run logs (gitignored)
 ```
@@ -240,24 +244,53 @@ plumbing, not the quality.
 ### Full run
 
 ```bash
-# 1. Normalize all sources (~10 min, streaming, ~150 MB RSS)
+# 0. Once, on a node with internet (only if the dense blocker is enabled)
+python scripts/fetch_dense_model.py --output /scratch/$USER/models/bge-m3 --verify
+
+# 1. Normalize all sources, train and test (~10 min, streaming, ~150 MB RSS)
 python scripts/prepare_data.py
 
-# 2. Build the inverted indexes (~2-4 min each, ~250 MB-1 GB peak per index)
-python scripts/build_indexes.py
+# 2. Build the indexes of every blocker enabled in config, for both splits
+python scripts/build_indexes.py --split train
+python scripts/build_indexes.py --split test
 
-# 3. Generate candidate pairs for all 2.2M S1 entities
-python scripts/generate_candidates.py
+# 3. Candidate pairs -> outputs/candidates/{train,test}_candidate_pairs.tsv
+python scripts/generate_candidates.py --split train --workers 0
+python scripts/generate_candidates.py --split test  --workers 0
 
-# 4. Evaluate against ground truth (validation split)
+# 4. Blocking evaluation against ground truth (train split)
 python scripts/evaluate_blocking.py --split val
-python scripts/evaluate_blocking.py --split all      # val + train + all
+
+# 5. Features: every labelled train entity, and EVERY test entity
+python scripts/extract_pair_features.py --split train --sample-fraction 1.0 --workers 32
+python scripts/extract_pair_features.py --split test  --sample-fraction 1.0 --workers 32
+
+# 6. Matcher (entity-grouped out-of-fold LightGBM, threshold tuned on val)
+python scripts/train_model.py
+
+# 7. Submission (+ a scored dry run on train)
+python scripts/predict.py --split test     # -> outputs/submission/matching_results.tsv
+python scripts/predict.py --split train    # dry run, macro F0.5 vs ground truth
 ```
 
-Step 2 builds one index per enabled blocker per target source, and step 3 runs
-each of them; step 3 verifies the char candidates, so give it the node's cores
+Step 2 builds one index per **enabled** blocker per target source - the same set
+step 3 loads. Step 3 verifies the char candidates, so give it the node's cores
 with `--workers 0` (auto) or an explicit count. `--blockers exact_name` forces a
 single blocker for a quick run without rebuilding anything.
+
+**Artifacts are never silently reused across runs of a different shape.** Each
+prepared table carries a provenance sidecar (`*.meta.json`: row limit,
+normalization, TSV dialect, raw file size/mtime) and each index a build record
+(row limit, blocker cell, key field, prepared-table signature). A stage that finds
+a mismatching artifact rebuilds it; `generate_candidates.py` refuses an index that
+no longer matches the config. So the smoke test below can be followed by the full
+run without `--overwrite`.
+
+**Strict TSV.** Every read and write uses `quoting=QUOTE_NONE`: a `"` in a
+business name is an ordinary character (pandas' default would let an unmatched
+quote swallow the following rows). `prepare_data.py` also compares parsed rows
+against the raw file's physical line count and fails on a mismatch
+(`--allow-row-loss` to accept it).
 
 Stage-by-stage reference:
 
@@ -265,7 +298,7 @@ Stage-by-stage reference:
 |---|---|---|---|
 | `prepare_data.py` | `train_source{1,2,3}.tsv` | `outputs/prepared/train_source{1,2,3}_norm.tsv` | ~150 MB |
 | `build_indexes.py` | prepared S2/S3 | `outputs/indexes/train_source{2,3}_<blocker>/` (one per enabled blocker) | ~250 MB-1 GB/index |
-| `generate_candidates.py` | prepared S1 + indexes | `outputs/candidates/candidate_pairs.tsv` (`token_df`/`char_jaccard` columns appear when those blockers are enabled) | ~300 MB |
+| `generate_candidates.py` | prepared S1 + indexes | `outputs/candidates/{split}_candidate_pairs.tsv` (`token_df`/`char_jaccard`/`dense_cosine` columns appear when those blockers are enabled; a legacy `candidate_pairs.tsv` is still read for train) | ~300 MB |
 | `evaluate_blocking.py` | candidates + ground truth | `outputs/candidates/blocking_metrics_*.json` | ~600 MB |
 
 `prepare_data.py` also writes `{split}_source1_norm.tsv` with a `split` column
@@ -577,6 +610,32 @@ calibration used, and a test pins it to
 `--workers`) only shards that verification: results are identical at any worker
 count.
 
+### The dense blocker (implemented, not yet calibrated)
+
+`dense` (`DenseIndex` in `src/blocking.py`) embeds `name_norm` with **BAAI/bge-m3**
+(MIT licence, ~568M parameters, 1024-dim, multilingual) and searches a FAISS
+inner-product index: each S1 keeps its `top_k` nearest targets with cosine
+`>= min_score`, and the cosine is carried as `dense_cosine` evidence (and as the
+`dense_cosine` / `blocker_dense` matcher features). It exists for the pairs no
+lexical signal can see - the 134,718 cross-script true pairs above.
+
+* **Offline by construction.** `local_files_only: true` is the default; the model
+  is fetched once with `scripts/fetch_dense_model.py` and loaded from that
+  directory. Compute nodes never contact the hub.
+* **Disabled by default** until the HPC recall x volume run picks `top_k` /
+  `min_score`. Enable with `blocking.dense.enabled: true` (plus
+  `model_name_or_path`), or pass `--blockers exact_name,token,char_ngram,dense`.
+* **Scale.** Encoding ~12.6M names is the GPU stage (`compute.device`); target
+  embeddings are stored once as float16. `faiss_factory: Flat` is exact; at 5M x
+  1024 prefer an IVF/HNSW factory once its recall cost is measured.
+* **Measured on the synthetic smoke test** (`tests/fixtures/synthetic_smoke_test.py`,
+  real bge-m3): true cross-script pairs score **0.67-0.84**, overlapping Latin
+  near-miss negatives (e.g. "Acme Holdings" vs "Acme Plumbing" at 0.72). Two
+  consequences: `min_score` must stay low (default 0.60 - retrieval is
+  recall-first), and **no single cosine cut separates them**, so dense-only pairs
+  must be decided by the LightGBM matcher, which sees `dense_cosine` next to the
+  lexical features - not by the one-feature `--model threshold` baseline.
+
 A **DF=5000 / rarest-K=1 token variant remains an independent background
 experiment**, run through `scripts/calibrate_token_blocker.py`. It is
 deliberately *not* wired into `configs/config.yaml`, and the measured evidence
@@ -702,10 +761,10 @@ outputs/
 │   ├── train_source3_*/
 │   └── index_summary.json
 └── candidates/
-    ├── candidate_pairs.tsv           source1_entity_id, matched_entity_id,
+    ├── {split}_candidate_pairs.tsv   source1_entity_id, matched_entity_id,
     │                                 source, blockers [, token_df]
     │                                 [, char_jaccard]
-    ├── candidate_pairs_stats.json
+    ├── {split}_candidate_pairs_stats.json
     └── blocking_metrics_*.json
 ```
 
@@ -719,14 +778,21 @@ is what records which generator produced the pair.
 format is defined by this project; matched ids are always valid S2/S3 ids and
 deduplicated per S1.
 
-`matching_results.tsv` (the graded artifact) is **not produced yet** - see
-`scripts/predict.py`. It is blocked on the challenge's exact submission format,
-which was not provided. The only format evidence available is the training ground
-truth (`source1_entity_id`, comma-separated `matched_entity_ids`), which is the
-likely shape, but guessing the format of the graded file would be worse than
-asking. Once confirmed, `predict.py` becomes a small merge-join; the constraints
-it must satisfy are already documented in that file (every S1 exactly once,
-including the 123,247 with no match; deduplicated ids; deterministic ordering).
+`matching_results.tsv` (the graded artifact) is written by `scripts/predict.py`
+in the training ground truth's shape - `source1_entity_id<TAB>matched_entity_ids`,
+ids comma-separated:
+
+* **every S1 entity exactly once, in S1 file order** - the entity list comes from
+  the raw S1 file, so entities the blockers proposed nothing for (absent from every
+  candidate and feature file) are still written;
+* **a singleton is an exact empty string** - the line is `S1-12<TAB>`, never `nan`;
+* ids deduplicated and sorted, LF line endings, no BOM, so reruns are byte-identical.
+
+The file is then validated byte by byte (`src/submission.py`), and `predict.py`
+refuses a feature file from a sampled or partial extraction, which would silently
+turn the unsampled entities into singletons. `scripts/score_submission.py`
+validates any submission and, for the train split, scores it (macro F0.5,
+`score_zero`).
 
 ---
 
@@ -767,9 +833,22 @@ The next step is **step 5, the matcher**, not further blocking: at the measured
 operating point the marginal precision of the remaining name-blocking headroom is
 far below what the matcher can add by rejecting false candidates.
 
-`src/features.py`, `src/matching_model.py`, `scripts/train_model.py` and
-`scripts/predict.py` are deliberate stubs that raise `NotImplementedError` with an
-explanation. Building a matcher now would mostly measure the blocker's recall.
+Since then: the V1 matcher (`src/matching_model.py`, `scripts/train_model.py`),
+the submission path (`scripts/predict.py`, `src/submission.py`) and the dense
+blocker (step 4, pending calibration) are implemented. `src/features.py` remains a
+stub; the feature definitions live in `scripts/extract_pair_features.py`.
+
+### Verification
+
+```bash
+python -m pytest tests/                       # unit + integration suites, no downloads
+python tests/fixtures/synthetic_smoke_test.py --model-path /path/to/bge-m3
+```
+
+The smoke test builds a tiny train/test world (cross-script Devanagari/Kannada
+pairs, singletons, an empty-name entity, quote characters) and runs every stage as
+a CLI subprocess with the hub switched off. Under pytest it runs when
+`ER_DENSE_MODEL` points at a local model, and is skipped otherwise.
 
 ---
 

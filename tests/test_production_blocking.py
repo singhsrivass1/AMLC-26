@@ -51,6 +51,8 @@ from src.blocking import (  # noqa: E402
     BLOCKER_EXACT_NAME,
     BLOCKER_TOKEN,
     INDEX_BUILDERS,
+    INDEX_LOADERS,
+    LEXICAL_BLOCKERS,
     UNION_BLOCKERS,
     CharNgramIndex,
     ExactNameIndex,
@@ -715,16 +717,13 @@ def test_union_rejects_misaligned_evidence():
 # ---------------------------------------------------------------------------
 # registry and settings
 # ---------------------------------------------------------------------------
-def test_registry_covers_the_union_and_leaves_dense_unimplemented():
-    assert UNION_BLOCKERS == (BLOCKER_EXACT_NAME, BLOCKER_TOKEN, BLOCKER_CHAR_NGRAM)
+def test_registry_covers_the_union_including_dense():
+    assert LEXICAL_BLOCKERS == (BLOCKER_EXACT_NAME, BLOCKER_TOKEN, BLOCKER_CHAR_NGRAM)
+    # dense is last, so the lexical provenance strings are unchanged by its addition
+    assert UNION_BLOCKERS == LEXICAL_BLOCKERS + (BLOCKER_DENSE,)
     for blocker in UNION_BLOCKERS:
         assert blocker in INDEX_BUILDERS, blocker
-    try:
-        INDEX_BUILDERS[BLOCKER_DENSE]()
-    except NotImplementedError as error:
-        assert BLOCKER_DENSE in str(error)
-    else:
-        raise AssertionError("dense must still be unimplemented")
+        assert blocker in INDEX_LOADERS, blocker
 
 
 def test_evidence_columns_follow_the_enabled_blockers():
@@ -837,7 +836,9 @@ def _write_end_to_end_fixture(root: Path) -> Path:
         table.to_csv(path, sep="\t", index=False)
 
     for source in ("source2", "source3"):
-        for blocker in UNION_BLOCKERS:
+        # The lexical set: the config leaves dense disabled, and the dense blocker has
+        # its own tests (tests/test_dense_blocker.py) with a download-free encoder.
+        for blocker in LEXICAL_BLOCKERS:
             build_index(loaded, "train", source, blocker, log=LOG)
     return config_path
 

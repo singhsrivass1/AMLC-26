@@ -142,7 +142,7 @@ import numpy as np
 import pandas as pd
 
 from .blocking import PAIR_MULTIPLIER
-from .data_loader import GroundTruth, load_ground_truth
+from .data_loader import TSV_QUOTING, GroundTruth, load_ground_truth
 from .evaluation import (
     CANDIDATE_S1_COLUMN,
     CANDIDATE_SOURCE_COLUMN,
@@ -169,8 +169,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
-# The 27 model features, in the order ``scripts/extract_pair_features.py`` writes
-# them (its FEATURE_DTYPES minus NON_FEATURE_COLUMNS). Kept here as a tuple rather
+# The 29 model features, in the order ``scripts/extract_pair_features.py`` writes
+# them (its FEATURE_DTYPES minus NON_FEATURE_COLUMNS). ``dense_cosine`` and
+# ``blocker_dense`` carry the dense blocker's evidence: without them a dense-only
+# (e.g. cross-script) pair would be judged on lexical features alone, which are ~0
+# for it by construction, and rejected. Kept here as a tuple rather
 # than imported from the script - ``src`` does not import from ``scripts`` - and
 # checked against the feature file's own header at read time by
 # ``resolve_feature_columns``, so a change on either side fails loudly instead of
@@ -195,9 +198,11 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "both_address_missing",
     "token_df",
     "char_jaccard",
+    "dense_cosine",
     "blocker_exact_name",
     "blocker_token",
     "blocker_char_ngram",
+    "blocker_dense",
     "n_blockers",
     "s1_candidate_count",
     "source_is_s2",
@@ -227,9 +232,11 @@ FEATURE_DTYPES: dict[str, str] = {
     "both_address_missing": "uint8",
     "token_df": "float32",
     "char_jaccard": "float32",
+    "dense_cosine": "float32",
     "blocker_exact_name": "uint8",
     "blocker_token": "uint8",
     "blocker_char_ngram": "uint8",
+    "blocker_dense": "uint8",
     "n_blockers": "uint8",
     "s1_candidate_count": "int32",
     "source_is_s2": "uint8",
@@ -306,7 +313,7 @@ LIGHTGBM_MISSING_MESSAGE = (
 # Reading the feature matrix
 # ---------------------------------------------------------------------------
 def resolve_feature_columns(header: Sequence[str]) -> list[str]:
-    """The 27 feature columns present in a feature file, verified against the header.
+    """The feature columns present in a feature file, verified against the header.
 
     Raises rather than guessing: if the extractor's feature set and this module's
     disagree, the model would train on a different matrix than the one it reports.
@@ -356,6 +363,7 @@ def iter_feature_chunks(
         na_values=[""],
         keep_default_na=False,
         na_filter=True,
+        quoting=TSV_QUOTING,
         chunksize=chunksize,
         on_bad_lines="warn",
     )
@@ -1492,8 +1500,10 @@ def train(
     n_rows = len(labels)
     is_true = labels.astype(bool)
 
-    # The feature file is the val entity split, so the val mask is the honest reporting
-    # population. `sampled_mask` narrows that to the entities this file actually has
+    # The feature file normally covers every labelled entity (extract_pair_features
+    # --population all): every row trains out-of-fold, so every entity's score comes
+    # from a model that never saw it, and the threshold is tuned and reported on the
+    # val entities only. `sampled_mask` narrows that to the entities this file actually has
     # rows for, and is reported separately: an entity the blocker proposed nothing for
     # is a blocking miss, not a matcher miss.
     covered_mask = np.zeros(n_entities, dtype=bool)

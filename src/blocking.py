@@ -99,6 +99,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import time
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -166,9 +167,12 @@ BLOCKER_CHAR_NGRAM = "char_ngram"
 BLOCKER_DENSE = "dense"
 KNOWN_BLOCKERS = (BLOCKER_EXACT_NAME, BLOCKER_TOKEN, BLOCKER_CHAR_NGRAM, BLOCKER_DENSE)
 
+# The three lexical generators - the calibrated provisional production set.
+LEXICAL_BLOCKERS = (BLOCKER_EXACT_NAME, BLOCKER_TOKEN, BLOCKER_CHAR_NGRAM)
+
 # The blockers a union may combine, in the order provenance is built. Fixed order
 # so the candidate output does not depend on CLI argument order.
-UNION_BLOCKERS = (BLOCKER_EXACT_NAME, BLOCKER_TOKEN, BLOCKER_CHAR_NGRAM)
+UNION_BLOCKERS = LEXICAL_BLOCKERS + (BLOCKER_DENSE,)
 
 # Which normalized column each blocker keys on when the config does not say. The
 # char blocker keys on ``name_key`` (separators removed) because that is the
@@ -187,6 +191,44 @@ DEFAULT_KEY_FIELDS = {
 BLOCKER_SETTING_DEFAULTS = {
     BLOCKER_TOKEN: {"df_cap": 1000, "rarest_k": 1},
     BLOCKER_CHAR_NGRAM: {"df_cap": 1000, "rarest_k": 5, "jaccard": 0.3},
+    # Dense multilingual retrieval. top_k / min_score are NOT calibrated yet - they
+    # are the knobs the HPC recall x volume run has to choose, exactly as df_cap /
+    # rarest_k / jaccard were chosen for the lexical blockers.
+    BLOCKER_DENSE: {
+        # A local directory in production (no network at runtime); a hub id only
+        # together with local_files_only=false, i.e. on a machine allowed to download.
+        "model_name_or_path": "BAAI/bge-m3",
+        "backend": "sentence_transformers",
+        "local_files_only": True,
+        # Business names are short; 64 tokens covers them and is ~8x cheaper than
+        # bge-m3's 8192 default.
+        "max_length": 64,
+        "batch_size": 256,
+        # auto -> compute.device (CUDA when present, else CPU).
+        "device": "auto",
+        # FAISS index_factory string over inner product (= cosine on normalized
+        # vectors). "Flat" is exact; at 5M x 1024 prefer e.g. "IVF16384,Flat" or
+        # "HNSW32" once the recall cost of approximation has been measured.
+        "faiss_factory": "Flat",
+        "nprobe": 32,
+        "train_sample": 500_000,
+        "top_k": 20,
+        # Retrieval is recall-first: the matcher does the precision work. bge-m3 puts
+        # true cross-script pairs at ~0.67-0.84 cosine (synthetic smoke test; "राम
+        # मार्केटिंग प्राइवेट लिमिटेड" vs "ram marketing private limited" = 0.758), so a
+        # 0.75 floor would drop most of the pairs this blocker exists for.
+        "min_score": 0.60,
+    },
+}
+
+# Settings that change what an index *contains*. A persisted index whose recorded
+# value differs from the config's is a different index and must be rebuilt. The
+# remaining dense settings (top_k, min_score, nprobe, batch_size, device,
+# local_files_only) are applied at query time, so changing them needs no rebuild.
+BUILD_IDENTITY_SETTINGS = {
+    BLOCKER_TOKEN: ("df_cap", "rarest_k"),
+    BLOCKER_CHAR_NGRAM: ("df_cap", "rarest_k", "jaccard"),
+    BLOCKER_DENSE: ("model_name_or_path", "backend", "max_length", "faiss_factory"),
 }
 
 # Per-pair evidence a blocker can carry into the candidate file, as
@@ -196,6 +238,7 @@ BLOCKER_SETTING_DEFAULTS = {
 EVIDENCE_COLUMNS = {
     BLOCKER_CHAR_NGRAM: ("char_jaccard", "%.4f"),
     BLOCKER_TOKEN: ("token_df", "%.0f"),
+    BLOCKER_DENSE: ("dense_cosine", "%.4f"),
 }
 
 
@@ -250,6 +293,8 @@ def resolve_blocker_settings(config: dict, blocker: str) -> dict:
             f"{sorted(defaults)}"
         )
     settings = {name: section.get(name, default) for name, default in defaults.items()}
+    if blocker == BLOCKER_DENSE:
+        return _validate_dense_settings(config, settings)
 
     for name in ("df_cap", "rarest_k"):
         value = settings[name]
@@ -264,6 +309,63 @@ def resolve_blocker_settings(config: dict, blocker: str) -> dict:
             )
         settings["jaccard"] = float(value)
     return settings
+
+
+def _validate_dense_settings(config: dict, settings: dict) -> dict:
+    """Type-check the dense cell and resolve ``device: auto`` through ``compute.device``."""
+    for name in ("max_length", "batch_size", "top_k", "nprobe", "train_sample"):
+        value = settings[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"blocking.dense.{name} must be a positive integer, got {value!r}")
+    value = settings["min_score"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not -1.0 <= float(value) <= 1.0:
+        raise ValueError(f"blocking.dense.min_score must be a cosine in [-1, 1], got {value!r}")
+    settings["min_score"] = float(value)
+    if settings["backend"] not in DENSE_BACKENDS:
+        raise ValueError(
+            f"blocking.dense.backend must be one of {DENSE_BACKENDS}, got {settings['backend']!r}"
+        )
+    for name in ("model_name_or_path", "faiss_factory"):
+        if not isinstance(settings[name], str) or not settings[name]:
+            raise ValueError(f"blocking.dense.{name} must be a non-empty string")
+    settings["local_files_only"] = bool(settings["local_files_only"])
+    if str(settings["device"]) == "auto":
+        from .utils import resolve_device_from_config
+
+        settings["device"] = resolve_device_from_config(config)
+    return settings
+
+
+def identity_settings(blocker: str, settings: dict) -> dict:
+    """The subset of a resolved cell that defines the index's content."""
+    return {name: settings[name] for name in BUILD_IDENTITY_SETTINGS.get(blocker, ()) if name in settings}
+
+
+def enabled_blockers(config: dict, requested: Optional[str] = None) -> list[str]:
+    """Blockers to run: an explicit comma list, else those enabled in config.
+
+    Shared by ``build_indexes.py`` and ``generate_candidates.py`` so the two can
+    never disagree about which indexes a run needs. Always returned in
+    :data:`UNION_BLOCKERS` order, so the per-pair provenance string does not depend
+    on how the list was spelled. An explicit list wins even for blockers the config
+    leaves disabled - naming them is the more specific instruction.
+
+    Raises:
+        ValueError: on an unknown blocker name.
+    """
+    if requested:
+        named = [b.strip() for b in requested.split(",") if b.strip()]
+        unknown = [b for b in named if b not in KNOWN_BLOCKERS]
+        if unknown:
+            raise ValueError(f"unknown blocker(s) {unknown}; expected from {KNOWN_BLOCKERS}")
+        return [b for b in UNION_BLOCKERS if b in set(named)]
+
+    blocking = config.get("blocking", {}) or {}
+    active = [b for b in UNION_BLOCKERS if (blocking.get(b, {}) or {}).get("enabled", False)]
+    if active:
+        return active
+    logger.warning("no blocker is enabled in config; falling back to %s", BLOCKER_EXACT_NAME)
+    return [BLOCKER_EXACT_NAME]
 
 
 
@@ -704,7 +806,9 @@ class ExactNameIndex:
         verified = self._verify_strings(found_positions, key_array[non_empty])
         final_positions = np.where(found & verified, found_positions, -1)
 
-        subset_counts = np.zeros(len(key_array), dtype=np.int64)
+        # Sized to the non-empty subset, not the whole query: sizing it to the query
+        # crashed any chunk holding an empty key (a name that normalizes to "").
+        subset_counts = np.zeros(len(final_positions), dtype=np.int64)
         valid = final_positions >= 0
         if valid.any():
             offset_index = final_positions[valid]
@@ -2147,15 +2251,496 @@ class CharNgramIndex(MultiKeyIndex):
         return index
 
 
-def _not_implemented(blocker: str):
-    def _builder(*args: Any, **kwargs: Any):
-        raise NotImplementedError(
-            f"blocker {blocker!r} is planned but not implemented yet.\n"
-            f"  Implemented blockers: {UNION_BLOCKERS}.\n"
-            f"  See README 'Blocking' for the plan."
+# ---------------------------------------------------------------------------
+# Dense multilingual retrieval (bge-m3 + FAISS)
+# ---------------------------------------------------------------------------
+# Why this blocker exists: the three lexical generators can reach at most 82.19% of
+# true pairs, and 134,718 of the unreachable ones are cross-script (a Devanagari S1
+# name against a romanized target). A character signal cannot see those by
+# construction; a multilingual encoder maps both spellings near each other.
+#
+# Semantics: each target name is embedded once (L2-normalized), S1 names are
+# embedded per chunk, and every S1 keeps its ``top_k`` nearest targets whose cosine
+# is at least ``min_score``. The cosine is carried as ``dense_cosine`` evidence.
+DENSE_BACKEND_SENTENCE_TRANSFORMERS = "sentence_transformers"
+# Deterministic char-trigram feature hashing. PLUMBING TESTS ONLY: it needs no model
+# download, so the index/union/persistence path can be tested anywhere, but it has
+# no multilingual knowledge and must never be used for a real run.
+DENSE_BACKEND_HASHING = "hashing"
+DENSE_BACKENDS = (DENSE_BACKEND_SENTENCE_TRANSFORMERS, DENSE_BACKEND_HASHING)
+HASHING_DIM = 256
+
+DENSE_EMBEDDINGS_FILE = "embeddings.npy"
+DENSE_FAISS_FILE = "faiss.index"
+DENSE_SEARCH_BATCH = 16_384
+DENSE_ADD_BATCH = 262_144
+
+DENSE_DEPENDENCY_MESSAGE = (
+    "the dense blocker needs torch, sentence-transformers and faiss:\n"
+    "  pip install torch sentence-transformers faiss-cpu   # faiss-gpu on a CUDA node"
+)
+
+_ENCODERS: dict[tuple, Any] = {}
+# One-entry memo of the last query batch: generate_candidates queries the S2 and the
+# S3 dense index with the same S1 chunk, and encoding it twice would double the most
+# expensive step of the query.
+_LAST_QUERY: dict[str, Any] = {"key": None, "embeddings": None}
+
+
+def _import_faiss():
+    try:
+        import faiss  # noqa: WPS433 - optional dependency, imported on use
+    except ImportError as exc:
+        raise ImportError(DENSE_DEPENDENCY_MESSAGE) from exc
+    return faiss
+
+
+class HashingEncoder:
+    """Char-trigram feature hashing into ``HASHING_DIM`` dims. Test-only (see above)."""
+
+    def __init__(self, dim: int = HASHING_DIM) -> None:
+        self.dim = int(dim)
+
+    def encode(self, texts: Sequence[str]) -> np.ndarray:
+        import zlib
+
+        out = np.zeros((len(texts), self.dim), dtype=np.float32)
+        for row, text in enumerate(texts):
+            padded = f" {text} "
+            for start in range(len(padded) - 2):
+                out[row, zlib.crc32(padded[start : start + 3].encode("utf-8")) % self.dim] += 1.0
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return out / norms
+
+
+class SentenceTransformerEncoder:
+    """A sentence-transformers model (bge-m3 by default), L2-normalized output.
+
+    Loaded strictly from local files when ``local_files_only`` - the challenge
+    forbids external calls at runtime, so a compute node must never reach the hub.
+    """
+
+    def __init__(
+        self,
+        model_name_or_path: str,
+        device: str,
+        max_length: int,
+        batch_size: int,
+        local_files_only: bool,
+    ) -> None:
+        if local_files_only:
+            # Belt and braces: the kwarg covers the model files, the variables cover
+            # every other hub call (tokenizer configs, telemetry) transformers makes.
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise ImportError(DENSE_DEPENDENCY_MESSAGE) from exc
+
+        location = Path(model_name_or_path).expanduser()
+        source = str(location) if location.exists() else model_name_or_path
+        try:
+            model = SentenceTransformer(source, device=device, local_files_only=local_files_only)
+        except OSError as exc:
+            raise OSError(
+                f"cannot load dense model {model_name_or_path!r} from local files "
+                f"(local_files_only={local_files_only}).\n"
+                "  Fetch it once on a machine with internet access:\n"
+                "    python scripts/fetch_dense_model.py --output /path/to/models/bge-m3\n"
+                "  then set blocking.dense.model_name_or_path to that directory."
+            ) from exc
+        model.max_seq_length = int(max_length)
+        if str(device).startswith("cuda"):
+            model.half()
+        self.model = model
+        self.batch_size = int(batch_size)
+        getter = getattr(model, "get_embedding_dimension", None) or getattr(
+            model, "get_sentence_embedding_dimension"
+        )
+        self.dim = int(getter())
+
+    def encode(self, texts: Sequence[str]) -> np.ndarray:
+        if len(texts) == 0:
+            return np.empty((0, self.dim), dtype=np.float32)
+        embeddings = self.model.encode(
+            list(texts),
+            batch_size=self.batch_size,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        return np.asarray(embeddings, dtype=np.float32)
+
+
+def _encoder_key(settings: dict) -> tuple:
+    return (
+        settings["backend"],
+        settings["model_name_or_path"],
+        str(settings["device"]),
+        int(settings["max_length"]),
+        bool(settings["local_files_only"]),
+    )
+
+
+def get_encoder(settings: dict):
+    """The encoder for a dense cell, loaded once per process and shared by S2/S3."""
+    key = _encoder_key(settings)
+    encoder = _ENCODERS.get(key)
+    if encoder is None:
+        if settings["backend"] == DENSE_BACKEND_HASHING:
+            encoder = HashingEncoder()
+        else:
+            encoder = SentenceTransformerEncoder(
+                settings["model_name_or_path"],
+                device=str(settings["device"]),
+                max_length=int(settings["max_length"]),
+                batch_size=int(settings["batch_size"]),
+                local_files_only=bool(settings["local_files_only"]),
+            )
+        _ENCODERS[key] = encoder
+    else:
+        # Batch size is a runtime knob; honour the latest value without a reload.
+        if hasattr(encoder, "batch_size"):
+            encoder.batch_size = int(settings["batch_size"])
+    return encoder
+
+
+def _encode_queries(settings: dict, texts: np.ndarray) -> np.ndarray:
+    """Encode a query batch, reusing the previous result for an identical batch."""
+    import hashlib
+
+    digest = hashlib.blake2b(digest_size=16)
+    for text in texts:
+        digest.update(text.encode("utf-8"))
+        digest.update(b"\x1f")
+    key = (_encoder_key(settings), len(texts), digest.hexdigest())
+    if _LAST_QUERY["key"] == key:
+        return _LAST_QUERY["embeddings"]
+    embeddings = get_encoder(settings).encode(texts)
+    _LAST_QUERY["key"], _LAST_QUERY["embeddings"] = key, embeddings
+    return embeddings
+
+
+class DenseIndex:
+    """FAISS inner-product index over normalized target-name embeddings.
+
+    Attributes:
+        postings: packed entity code of each FAISS row (row order = table order of
+            the target rows that had a non-empty key).
+        settings: the resolved dense cell. Build-identity settings come from the
+            index itself; query-time settings (top_k, min_score, nprobe, device,
+            batch_size) may be overridden at load without rebuilding.
+    """
+
+    def __init__(
+        self,
+        source: str,
+        prefix: str,
+        key_field: str,
+        postings: np.ndarray,
+        faiss_index: Any,
+        settings: dict,
+        dim: int,
+        n_entities_indexed: int = 0,
+        n_rows_without_key: int = 0,
+        embeddings: Optional[np.ndarray] = None,
+        directory: Optional[Path] = None,
+    ) -> None:
+        self.source = source
+        self.prefix = prefix
+        self.key_field = key_field
+        self.postings = postings
+        self.faiss_index = faiss_index
+        self.settings = dict(settings)
+        self.dim = int(dim)
+        self.n_entities_indexed = int(n_entities_indexed)
+        self.n_rows_without_key = int(n_rows_without_key)
+        self.embeddings = embeddings
+        self.directory = directory
+        self._gpu_resources = None
+        self._apply_search_parameters()
+
+    # -- introspection ------------------------------------------------------
+    @property
+    def n_keys(self) -> int:
+        return int(self.faiss_index.ntotal)
+
+    @property
+    def top_k(self) -> int:
+        return int(self.settings["top_k"])
+
+    @property
+    def min_score(self) -> float:
+        return float(self.settings["min_score"])
+
+    def memory_bytes(self) -> int:
+        vectors = self.n_keys * self.dim * 4 if "Flat" in self.settings["faiss_factory"] else 0
+        stored = self.embeddings.nbytes if self.embeddings is not None else 0
+        return int(self.postings.nbytes + vectors + stored)
+
+    def describe(self) -> dict:
+        return {
+            "source": self.source,
+            "key_field": self.key_field,
+            "backend": self.settings["backend"],
+            "model": self.settings["model_name_or_path"],
+            "dim": self.dim,
+            "faiss_factory": self.settings["faiss_factory"],
+            "top_k": self.top_k,
+            "min_score": self.min_score,
+            "device": str(self.settings["device"]),
+            "n_entities_indexed": self.n_entities_indexed,
+            "n_rows_without_key": self.n_rows_without_key,
+            "n_unique_keys": self.n_keys,
+            "n_postings": int(len(self.postings)),
+            "index_memory": human_bytes(self.memory_bytes()),
+        }
+
+    # -- build --------------------------------------------------------------
+    @classmethod
+    def build(
+        cls,
+        chunks: Iterable[pd.DataFrame] | Callable[[], Iterator[pd.DataFrame]],
+        source: str,
+        prefix: str,
+        key_field: str = NAME_NORM,
+        log: Optional[logging.Logger] = None,
+        total_rows: Optional[int] = None,
+        **settings: Any,
+    ) -> "DenseIndex":
+        """Embed every non-empty target key once and index it.
+
+        One pass. Embeddings are kept as float16 (half the RAM, negligible effect on
+        cosine ranking) and converted to float32 only in FAISS-sized batches. An
+        empty key is skipped exactly as the lexical blockers skip it: it carries no
+        signal, and embedding "" would put every nameless record next to every other.
+        """
+        log = log or logger
+        factory = _chunk_factory(chunks)
+        encoder = get_encoder(settings)
+        label = f"[{source}] dense"
+
+        parts_embeddings: list[np.ndarray] = []
+        parts_codes: list[np.ndarray] = []
+        rows = 0
+        skipped = 0
+        started = time.time()
+        for frame in factory():
+            texts = frame[key_field].to_numpy(dtype=object)
+            keep = np.fromiter((isinstance(t, str) and len(t) > 0 for t in texts), dtype=bool, count=len(texts))
+            rows += len(texts)
+            skipped += int((~keep).sum())
+            if not keep.any():
+                continue
+            codes = encode_entity_ids(frame["entity_id"].to_numpy(dtype=object)[keep])
+            embeddings = encoder.encode(texts[keep])
+            parts_embeddings.append(embeddings.astype(np.float16))
+            parts_codes.append(codes)
+            elapsed = max(time.time() - started, 1e-9)
+            log.info(
+                "  %s: %s/%s rows embedded (%.0f rows/s)",
+                label,
+                f"{rows:,}",
+                f"{total_rows:,}" if total_rows else "?",
+                rows / elapsed,
+            )
+
+        if parts_embeddings:
+            embeddings = np.concatenate(parts_embeddings)
+            postings = np.concatenate(parts_codes).astype(np.int64)
+        else:
+            dim = getattr(encoder, "dim", HASHING_DIM)
+            embeddings = np.empty((0, dim), dtype=np.float16)
+            postings = _EMPTY_INT64
+            log.warning("%s: no non-empty %s values to index", label, key_field)
+        del parts_embeddings, parts_codes
+
+        faiss_index = _build_faiss_index(embeddings, settings, log, label)
+        log.info(
+            "%s: %s vectors (dim %s, %s), %s rows skipped for an empty key, %.1f s",
+            label,
+            f"{faiss_index.ntotal:,}",
+            embeddings.shape[1],
+            settings["faiss_factory"],
+            f"{skipped:,}",
+            time.time() - started,
+        )
+        return cls(
+            source=source,
+            prefix=prefix,
+            key_field=key_field,
+            postings=postings,
+            faiss_index=faiss_index,
+            settings=settings,
+            dim=embeddings.shape[1],
+            n_entities_indexed=len(postings),
+            n_rows_without_key=skipped,
+            embeddings=embeddings,
         )
 
-    return _builder
+    # -- query --------------------------------------------------------------
+    def query(self, values: Sequence[str] | pd.Series) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Dense candidates for one S1 chunk, with each pair's cosine.
+
+        Every S1 keeps its ``top_k`` nearest targets with cosine >= ``min_score``;
+        the output is sorted by packed pair, like every other blocker's.
+        """
+        texts = _as_object_array(values)
+        if texts.size == 0 or self.n_keys == 0:
+            return _EMPTY_INT64, {}
+        non_empty = np.flatnonzero(
+            np.fromiter((isinstance(t, str) and len(t) > 0 for t in texts), dtype=bool, count=len(texts))
+        )
+        if non_empty.size == 0:
+            return _EMPTY_INT64, {}
+
+        queries = _encode_queries(self.settings, texts[non_empty])
+        k = min(self.top_k, self.n_keys)
+        packed_parts: list[np.ndarray] = []
+        score_parts: list[np.ndarray] = []
+        for start in range(0, len(non_empty), DENSE_SEARCH_BATCH):
+            stop = min(start + DENSE_SEARCH_BATCH, len(non_empty))
+            scores, rows = self.faiss_index.search(
+                np.ascontiguousarray(queries[start:stop], dtype=np.float32), k
+            )
+            keep = (rows >= 0) & (scores >= self.min_score)
+            if not keep.any():
+                continue
+            owners = np.repeat(non_empty[start:stop], k).reshape(stop - start, k)[keep]
+            packed_parts.append(pack_pairs(owners, self.postings[rows[keep]]))
+            score_parts.append(np.clip(scores[keep].astype(np.float64), -1.0, 1.0))
+
+        if not packed_parts:
+            return _EMPTY_INT64, {"dense_cosine": np.empty(0, dtype=np.float64)}
+        packed = np.concatenate(packed_parts)
+        cosine = np.concatenate(score_parts)
+        # Target rows are distinct per query and entity ids are unique per source, so
+        # pairs are already unique; np.unique only sorts, and keeps evidence aligned.
+        unique_packed, first = np.unique(packed, return_index=True)
+        return unique_packed, {"dense_cosine": cosine[first]}
+
+    # -- persistence --------------------------------------------------------
+    def save(self, directory: str | os.PathLike) -> Path:
+        faiss = _import_faiss()
+        directory = ensure_dir(directory)
+        np.save(directory / POSTINGS_FILE, self.postings)
+        if self.embeddings is not None:
+            # Kept for downstream use: a dense_cosine feature on *every* candidate
+            # pair (not only the dense-proposed ones) is a gather over these.
+            np.save(directory / DENSE_EMBEDDINGS_FILE, self.embeddings)
+        index = self.faiss_index
+        if self._gpu_resources is not None:  # pragma: no cover - needs a GPU build
+            index = faiss.index_gpu_to_cpu(index)
+        faiss.write_index(index, str(directory / DENSE_FAISS_FILE))
+        write_json(
+            directory / META_FILE,
+            {
+                "index_version": INDEX_VERSION,
+                "blocker": BLOCKER_DENSE,
+                "source": self.source,
+                "prefix": self.prefix,
+                "key_field": self.key_field,
+                "dim": self.dim,
+                "settings": _jsonable_settings(self.settings),
+                "n_entities_indexed": self.n_entities_indexed,
+                "n_rows_without_key": self.n_rows_without_key,
+                "n_unique_keys": self.n_keys,
+                "n_postings": int(len(self.postings)),
+                "files": {
+                    "postings": POSTINGS_FILE,
+                    "faiss": DENSE_FAISS_FILE,
+                    "embeddings": DENSE_EMBEDDINGS_FILE if self.embeddings is not None else None,
+                },
+            },
+        )
+        self.directory = Path(directory)
+        return Path(directory)
+
+    @classmethod
+    def load(
+        cls,
+        directory: str | os.PathLike,
+        log: Optional[logging.Logger] = None,
+        settings: Optional[dict] = None,
+    ) -> "DenseIndex":
+        """Load a persisted dense index.
+
+        ``settings`` (the config's resolved cell) supplies the query-time knobs; the
+        build-identity settings always come from the index, since they describe the
+        vectors actually stored. A mismatch between the two is caught by
+        :func:`index_staleness` before any query runs.
+        """
+        faiss = _import_faiss()
+        directory = Path(directory)
+        meta = _read_index_meta(directory, BLOCKER_DENSE)
+        stored = dict(meta.get("settings") or {})
+        merged = dict(stored)
+        if settings:
+            for name, value in settings.items():
+                if name not in BUILD_IDENTITY_SETTINGS[BLOCKER_DENSE]:
+                    merged[name] = value
+        index = cls(
+            source=meta["source"],
+            prefix=meta["prefix"],
+            key_field=meta["key_field"],
+            postings=np.load(directory / POSTINGS_FILE),
+            faiss_index=faiss.read_index(str(directory / DENSE_FAISS_FILE)),
+            settings=merged,
+            dim=int(meta["dim"]),
+            n_entities_indexed=int(meta.get("n_entities_indexed", 0)),
+            n_rows_without_key=int(meta.get("n_rows_without_key", 0)),
+            directory=directory,
+        )
+        index._maybe_to_gpu()
+        if log:
+            log.info("loaded index %s: %s", directory.name, index.describe())
+        return index
+
+    # -- internals ----------------------------------------------------------
+    def _apply_search_parameters(self) -> None:
+        if "IVF" in str(self.settings.get("faiss_factory", "")):
+            faiss = _import_faiss()
+            faiss.ParameterSpace().set_index_parameter(
+                self.faiss_index, "nprobe", int(self.settings.get("nprobe", 32))
+            )
+
+    def _maybe_to_gpu(self) -> None:
+        """Move the index to the configured GPU when this FAISS build supports it."""
+        device = str(self.settings.get("device", "cpu"))
+        faiss = _import_faiss()
+        if not device.startswith("cuda") or not hasattr(faiss, "StandardGpuResources"):
+            return
+        gpu = int(device.split(":", 1)[1]) if ":" in device else 0  # pragma: no cover - GPU only
+        resources = faiss.StandardGpuResources()  # pragma: no cover
+        options = faiss.GpuClonerOptions()  # pragma: no cover
+        options.useFloat16 = True  # pragma: no cover
+        self.faiss_index = faiss.index_cpu_to_gpu(resources, gpu, self.faiss_index, options)  # pragma: no cover
+        self._gpu_resources = resources  # pragma: no cover
+
+
+def _build_faiss_index(embeddings: np.ndarray, settings: dict, log: logging.Logger, label: str):
+    """Create, train (if the factory needs it) and fill a FAISS inner-product index."""
+    faiss = _import_faiss()
+    dim = int(embeddings.shape[1])
+    index = faiss.index_factory(dim, str(settings["faiss_factory"]), faiss.METRIC_INNER_PRODUCT)
+    n = len(embeddings)
+    if not index.is_trained and n:
+        take = min(n, int(settings["train_sample"]))
+        rows = np.sort(np.random.default_rng(42).choice(n, take, replace=False))
+        log.info("  %s: training %s on %s vectors", label, settings["faiss_factory"], f"{take:,}")
+        index.train(np.ascontiguousarray(embeddings[rows], dtype=np.float32))
+    for start in range(0, n, DENSE_ADD_BATCH):
+        index.add(np.ascontiguousarray(embeddings[start : start + DENSE_ADD_BATCH], dtype=np.float32))
+    return index
+
+
+def _jsonable_settings(settings: dict) -> dict:
+    return {
+        name: (value if isinstance(value, (int, float, str, bool)) or value is None else str(value))
+        for name, value in settings.items()
+    }
 
 
 def _build_exact_name(
@@ -2192,16 +2777,75 @@ INDEX_BUILDERS = {
     BLOCKER_EXACT_NAME: _build_exact_name,
     BLOCKER_TOKEN: TokenIndex.build,
     BLOCKER_CHAR_NGRAM: CharNgramIndex.build,
-    BLOCKER_DENSE: _not_implemented(BLOCKER_DENSE),
+    BLOCKER_DENSE: DenseIndex.build,
 }
 
 # Loader per blocker. Kept explicit rather than derived from INDEX_BUILDERS because
-# the char index takes a runtime worker count the others do not.
-INDEX_LOADERS: dict[str, Callable[..., MultiKeyIndex]] = {
+# the char index takes a runtime worker count and the dense index its query-time
+# settings, which the others do not.
+INDEX_LOADERS: dict[str, Callable[..., Any]] = {
     BLOCKER_EXACT_NAME: ExactNameIndex.load,
     BLOCKER_TOKEN: TokenIndex.load,
     BLOCKER_CHAR_NGRAM: CharNgramIndex.load,
+    BLOCKER_DENSE: DenseIndex.load,
 }
+
+
+# ---------------------------------------------------------------------------
+# Build records: detecting stale indexes instead of silently reusing them
+# ---------------------------------------------------------------------------
+def _prepared_signature(config: dict, split: str, source: str) -> Optional[dict]:
+    """Size + mtime of the prepared table an index is built from."""
+    path = prepared_path(config, split, source)
+    if not path.is_file():
+        return None
+    stat = path.stat()
+    return {"file": path.name, "size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+
+
+def expected_build_record(
+    config: dict, split: str, source: str, blocker: str, limit: Optional[int] = None
+) -> dict:
+    """What an index built *now*, from this config, would record about itself."""
+    settings = resolve_blocker_settings(config, blocker)
+    return {
+        "limit": int(limit) if limit else None,
+        "key_field": _key_field_for(config, blocker),
+        "settings": _jsonable_settings(identity_settings(blocker, settings)),
+        "prepared": _prepared_signature(config, split, source),
+    }
+
+
+def index_staleness(directory: Path, expected: dict, check_limit: bool = True) -> tuple[list[str], dict]:
+    """Differences between a persisted index and ``expected``; empty means reusable.
+
+    Returns ``(problems, meta)``. An index without a ``build`` record predates this
+    check: its settings are compared from the fields it did record, and the caller is
+    told (``meta['build']`` is absent) that its row limit cannot be verified.
+    """
+    meta = read_json(directory / META_FILE)
+    problems: list[str] = []
+    if meta.get("index_version") != INDEX_VERSION:
+        problems.append(f"index_version {meta.get('index_version')} != {INDEX_VERSION}")
+    record = meta.get("build")
+    if meta.get("key_field") != expected["key_field"]:
+        problems.append(f"key_field {meta.get('key_field')!r} != config {expected['key_field']!r}")
+    recorded_settings = (record or {}).get("settings") or meta.get("settings") or meta
+    for name, value in expected["settings"].items():
+        if name in recorded_settings and recorded_settings[name] != value:
+            problems.append(f"{name} {recorded_settings[name]!r} != config {value!r}")
+    if record is not None:
+        if check_limit and record.get("limit") != expected["limit"]:
+            problems.append(
+                f"built with limit={record.get('limit')} but limit={expected['limit']} was requested"
+            )
+        built_from, now = record.get("prepared"), expected["prepared"]
+        if built_from and now and built_from != now:
+            problems.append(
+                f"prepared table {now['file']} changed since the index was built "
+                f"(size/mtime {built_from['size']}/{built_from['mtime_ns']} -> {now['size']}/{now['mtime_ns']})"
+            )
+    return problems, meta
 
 
 def build_index(
@@ -2239,15 +2883,26 @@ def build_index(
     log = log or logger
     settings = resolve_blocker_settings(config, blocker)
     directory = index_dir_for(config, split, source, blocker)
+    expected = expected_build_record(config, split, source, blocker, limit)
 
     if not overwrite:
         meta_path = directory / META_FILE
         if meta_path.is_file():
-            existing = read_json(meta_path).get("index_version")
-            if existing == INDEX_VERSION:
+            # Reuse only an index that is provably the one this call would build: a
+            # smoke-test index (--limit) or one built at a different cell, or from a
+            # prepared table that has since been rewritten, is rebuilt - reusing it
+            # would silently run the full pipeline on the wrong candidates.
+            problems, meta = index_staleness(directory, expected)
+            if not problems:
+                if meta.get("build") is None:
+                    log.warning(
+                        "index at %s predates build records: its row limit cannot be "
+                        "verified. Pass --overwrite if it may be a smoke-test index.",
+                        directory,
+                    )
                 log.info("index already exists at %s - loading instead of rebuilding", directory)
-                return _load_index_at(directory, blocker, log=log)
-            log.warning("index at %s is version %s, rebuilding", directory, existing)
+                return _load_index_at(directory, blocker, log=log, settings=settings)
+            log.warning("index at %s is stale (%s) - rebuilding", directory, "; ".join(problems))
 
     key_field = _key_field_for(config, blocker)
     if key_field not in _prepared_columns(config, split, source):
@@ -2293,6 +2948,9 @@ def build_index(
         **settings,
     )
     index.save(directory)
+    meta = read_json(directory / META_FILE)
+    meta["build"] = expected
+    write_json(directory / META_FILE, meta)
     log.info("saved index to %s", directory)
     return index
 
@@ -2313,7 +2971,13 @@ def _prepared_columns(config: dict, split: str, source: str) -> set[str]:
     return set()
 
 
-def _load_index_at(directory: Path, blocker: str, log: Optional[logging.Logger] = None, workers: int = 1):
+def _load_index_at(
+    directory: Path,
+    blocker: str,
+    log: Optional[logging.Logger] = None,
+    workers: int = 1,
+    settings: Optional[dict] = None,
+):
     """Load a persisted index of any implemented blocker from its directory."""
     loader = INDEX_LOADERS.get(blocker)
     if loader is None:
@@ -2322,6 +2986,8 @@ def _load_index_at(directory: Path, blocker: str, log: Optional[logging.Logger] 
         )
     if blocker == BLOCKER_CHAR_NGRAM:
         return CharNgramIndex.load(directory, log=log, workers=workers)
+    if blocker == BLOCKER_DENSE:
+        return DenseIndex.load(directory, log=log, settings=settings)
     return loader(directory, log=log)
 
 
@@ -2332,15 +2998,40 @@ def load_index(
     blocker: str = BLOCKER_EXACT_NAME,
     log: Optional[logging.Logger] = None,
     workers: int = 1,
-) -> MultiKeyIndex:
+    verify: bool = False,
+):
     """Load a persisted index, with a clear error if it is missing.
 
     Args:
         workers: verification processes for the char blocker. Ignored by the others,
             which have no per-pair work to shard. Purely a performance knob: results
             do not depend on it.
+        verify: refuse an index that no longer matches the config (different cell,
+            key field or prepared table). A row-limited (smoke-test) index is allowed
+            but logged loudly, since a smoke run legitimately uses one.
+
+    Raises:
+        ValueError: ``verify`` and the index is stale.
     """
-    return _load_index_at(index_dir_for(config, split, source, blocker), blocker, log=log, workers=workers)
+    directory = index_dir_for(config, split, source, blocker)
+    settings = resolve_blocker_settings(config, blocker) if blocker == BLOCKER_DENSE else None
+    if verify and (directory / META_FILE).is_file():
+        expected = expected_build_record(config, split, source, blocker)
+        problems, meta = index_staleness(directory, expected, check_limit=False)
+        if problems:
+            raise ValueError(
+                f"index {directory} does not match the config: {'; '.join(problems)}\n"
+                f"  Rebuild it: python scripts/build_indexes.py --split {split} "
+                f"--sources {source} --blockers {blocker}"
+            )
+        built_limit = (meta.get("build") or {}).get("limit")
+        if built_limit:
+            (log or logger).warning(
+                "index %s was built from only the first %s rows (a smoke-test index)",
+                directory.name,
+                f"{built_limit:,}",
+            )
+    return _load_index_at(directory, blocker, log=log, workers=workers, settings=settings)
 
 
 # ---------------------------------------------------------------------------

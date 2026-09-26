@@ -116,6 +116,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.blocking import (  # noqa: E402
     BLOCKER_CHAR_NGRAM,
+    BLOCKER_DENSE,
     BLOCKER_EXACT_NAME,
     BLOCKER_TOKEN,
     UNION_BLOCKERS,
@@ -215,9 +216,11 @@ FEATURE_DTYPES: dict[str, str] = {
     # -- blocker evidence + provenance --
     "token_df": "float32",
     "char_jaccard": "float32",
+    "dense_cosine": "float32",
     "blocker_exact_name": "uint8",
     "blocker_token": "uint8",
     "blocker_char_ngram": "uint8",
+    "blocker_dense": "uint8",
     "n_blockers": "uint8",
     "s1_candidate_count": "int32",
     # -- other --
@@ -322,13 +325,13 @@ def first_token(text: str) -> str:
     return parts[0] if parts else ""
 
 
-def parse_provenance(text: str) -> tuple[int, int, int, int, int]:
-    """``(exact, token, char, n_blockers, unknowns)`` from a provenance string.
+def parse_provenance(text: str) -> tuple[int, int, int, int, int, int]:
+    """``(exact, token, char, dense, n_blockers, unknowns)`` from a provenance string.
 
     Provenance survives the union as comma-joined ``sourceN:blocker`` labels (see
     ``union_blockers``), so the blocker part is what identifies the blocker.
     """
-    exact = token = char = unknown = 0
+    exact = token = char = dense = unknown = 0
     if text:
         for part in text.split(","):
             blocker = part.rsplit(":", 1)[-1]
@@ -338,9 +341,11 @@ def parse_provenance(text: str) -> tuple[int, int, int, int, int]:
                 token = 1
             elif blocker == BLOCKER_CHAR_NGRAM:
                 char = 1
+            elif blocker == BLOCKER_DENSE:
+                dense = 1
             else:
                 unknown += 1
-    return exact, token, char, exact + token + char, unknown
+    return exact, token, char, dense, exact + token + char + dense, unknown
 
 
 # ---------------------------------------------------------------------------
@@ -472,23 +477,54 @@ def load_lookup(
 # ---------------------------------------------------------------------------
 # phase 1: sample S1 entities out of the candidate file
 # ---------------------------------------------------------------------------
+POPULATION_VAL = "val"
+POPULATION_TRAIN = "train"
+POPULATION_ALL = "all"
+POPULATIONS = (POPULATION_VAL, POPULATION_TRAIN, POPULATION_ALL)
+
+
+def resolve_population(split: str, requested: Optional[str]) -> str:
+    """Which S1 entities a run may sample from.
+
+    * ``--split test``: always **every** entity. The test split has no train/val
+      partition - the val hash is a device for holding out *labelled* entities - and
+      filtering by it used to drop ~80% of the test S1 entities, which would then
+      have been emitted as singletons.
+    * ``--split train``: ``all`` by default, so the matcher trains on every labelled
+      entity (its entity-grouped out-of-fold scores keep that leak-free, and the
+      threshold is still tuned on the val entities). ``val`` reproduces the original
+      val-only de-risk sample.
+    """
+    if split == "test":
+        if requested not in (None, POPULATION_ALL):
+            raise ValueError(
+                f"--population {requested} is meaningless for --split test: every test "
+                "S1 entity must be featurized, or it is silently emitted with no match"
+            )
+        return POPULATION_ALL
+    return requested or POPULATION_ALL
+
+
 def _sample_mask_for_ids(
     unique_ids: np.ndarray,
     cache: dict[str, int],
     config: dict,
     sub_threshold: int,
     log: logging.Logger,
+    population: str = POPULATION_VAL,
 ) -> np.ndarray:
     """Which of ``unique_ids`` are in the sample. Pure function of the id.
 
     Two conditions, both deterministic functions of the S1 id and nothing else:
-    the entity must be in the validation split (``assign_splits``, the same
-    function ``src/evaluation.py`` uses), and it must fall below
-    ``sub_threshold`` in a second bucket taken from the high bits of the same
-    64-bit hash. Because both are functions of the id alone, every candidate row
+    the entity must be in ``population`` (``val``/``train`` by ``assign_splits``, the
+    same function ``src/evaluation.py`` uses; ``all`` = no split filter), and it must
+    fall below ``sub_threshold`` in a second bucket taken from the high bits of the
+    same 64-bit hash. Because both are functions of the id alone, every candidate row
     of an entity makes the same decision, so whole entities are kept together
     without needing the file to be grouped by S1.
     """
+    if population not in POPULATIONS:
+        raise ValueError(f"unknown population {population!r}; expected one of {POPULATIONS}")
     section = config.get("evaluation", {}).get("split", {}) or {}
     val_fraction = section.get("val_fraction", 0.2)
     mode = section.get("mode", "hash")
@@ -497,12 +533,15 @@ def _sample_mask_for_ids(
     missing = [entity_id for entity_id in unique_ids if entity_id not in cache]
     if missing:
         series = pd.Series(missing, dtype=object)
-        labels = assign_splits(series, val_fraction=val_fraction, mode=mode, seed=seed)
-        is_val = labels == "val"
+        if population == POPULATION_ALL:
+            in_population = np.ones(len(series), dtype=bool)
+        else:
+            labels = assign_splits(series, val_fraction=val_fraction, mode=mode, seed=seed)
+            in_population = labels == population
         # A different slice of the same hash than assign_splits uses, so the
         # subsample is independent of the split decision.
         buckets = (stable_hash64(series) // np.uint64(1_000_000)) % np.uint64(1_000_000)
-        keep = is_val & (buckets < np.uint64(sub_threshold))
+        keep = in_population & (buckets < np.uint64(sub_threshold))
         for entity_id, flag in zip(missing, keep):
             cache[entity_id] = 1 if flag else 0
     return np.fromiter(
@@ -517,7 +556,8 @@ def scan_and_sample(
     log: logging.Logger,
 ) -> dict[str, Any]:
     """Phase 1: stream the candidate file, write the sampled rows, count per S1."""
-    source_path = candidates_path(config, args.candidates)
+    population = getattr(args, "population", None) or POPULATION_VAL
+    source_path = candidates_path(config, args.candidates, split=args.split)
     if not source_path.is_file():
         raise FileNotFoundError(
             f"candidate file not found: {source_path}\n"
@@ -552,7 +592,12 @@ def scan_and_sample(
     log.info("scanning %s", source_path)
     log.info("  columns read : %s", ", ".join(read_columns))
     log.info("  evidence cols: %s", ", ".join(evidence_columns) or "(none)")
-    log.info("  sample       : %.3f%% of validation S1 entities", args.sample_fraction * 100.0)
+    log.info(
+        "  sample       : %.3f%% of %s S1 entities (population=%s)",
+        args.sample_fraction * 100.0,
+        {"val": "validation", "train": "train-split", "all": "all"}[population],
+        population,
+    )
 
     cache: dict[str, int] = {}
     counts: dict[str, int] = {}
@@ -587,7 +632,7 @@ def scan_and_sample(
             # of per-chunk distinct counts, which would double-count ids straddling chunks.
             seen_entities.update(uniques)
             keep_by_entity = _sample_mask_for_ids(
-                uniques, cache, config, sub_threshold, log
+                uniques, cache, config, sub_threshold, log, population=population
             )
             keep = keep_by_entity[codes] if len(keep_by_entity) else np.zeros(len(chunk), dtype=bool)
             if not keep.any():
@@ -658,6 +703,7 @@ def scan_and_sample(
         "rss_sampled_peak": rss_tracker[0],
         "sample_path": output_dir / "sample_candidates.tsv",
         "sample_fraction": args.sample_fraction,
+        "population": population,
     }
 
 
@@ -853,8 +899,9 @@ def build_features(
     blocker_exact = np.fromiter((p[0] for p in parsed), dtype=np.int64, count=n)
     blocker_token = np.fromiter((p[1] for p in parsed), dtype=np.int64, count=n)
     blocker_char = np.fromiter((p[2] for p in parsed), dtype=np.int64, count=n)
-    n_blockers = np.fromiter((p[3] for p in parsed), dtype=np.int64, count=n)
-    _bump(integrity, "unknown_blocker_labels", sum(p[4] for p in parsed))
+    blocker_dense = np.fromiter((p[3] for p in parsed), dtype=np.int64, count=n)
+    n_blockers = np.fromiter((p[4] for p in parsed), dtype=np.int64, count=n)
+    _bump(integrity, "unknown_blocker_labels", sum(p[5] for p in parsed))
 
     evidence: dict[str, np.ndarray] = {}
     for column in EVIDENCE_FLOAT_COLUMNS:
@@ -919,9 +966,11 @@ def build_features(
             "both_address_missing": both_address_missing,
             "token_df": evidence["token_df"],
             "char_jaccard": evidence["char_jaccard"],
+            "dense_cosine": evidence["dense_cosine"],
             "blocker_exact_name": blocker_exact,
             "blocker_token": blocker_token,
             "blocker_char_ngram": blocker_char,
+            "blocker_dense": blocker_dense,
             "n_blockers": n_blockers,
             "s1_candidate_count": s1_candidate_count,
             "source_is_s2": source_is_s2,
@@ -2022,8 +2071,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--sample-fraction",
         type=float,
         default=0.03,
-        help="fraction of VALIDATION S1 entities to sample (whole entities). "
-        "0.03 of a 20%% val split is ~13k entities, ~2M candidate pairs",
+        help="fraction of the --population S1 entities to sample (whole entities). "
+        "Must be 1.0 for --split test: every test entity needs its features",
+    )
+    parser.add_argument(
+        "--population",
+        choices=POPULATIONS,
+        default=None,
+        help="which S1 entities may be sampled. Default: all (train: every labelled "
+        "entity, so the matcher trains on all of them; test: forced to all). "
+        "val reproduces the original val-only de-risk sample",
     )
     parser.add_argument("--chunksize", type=int, default=None, help="candidate rows per chunk")
     parser.add_argument("--feature-batch-size", type=int, default=200_000, help="rows per feature batch")
@@ -2049,12 +2106,28 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="experiment directory (default: <candidates_dir>/../experiments/step3_features)",
+        help="experiment directory (default: <candidates_dir>/../experiments/"
+        "step3_features for train, .../step3_features_test for test)",
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
     validate_workers(parser, args.workers)
+    try:
+        args.population = resolve_population(args.split, args.population)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.split == "test" and args.sample_fraction < 1.0:
+        parser.error(
+            f"--split test needs --sample-fraction 1.0 (got {args.sample_fraction}): an "
+            "unsampled test entity has no features and would be emitted with no match"
+        )
     return args
+
+
+def default_output_dir(config: dict, split: str) -> Path:
+    """Per-split experiment directory, so a test run never overwrites train features."""
+    name = "step3_features" if split == "train" else f"step3_features_{split}"
+    return Path(config["resolved"]["candidates_dir"]).parent / "experiments" / name
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -2067,7 +2140,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.output_dir:
         output_dir = Path(args.output_dir).expanduser().resolve()
     else:
-        output_dir = Path(config["resolved"]["candidates_dir"]).parent / "experiments" / "step3_features"
+        output_dir = default_output_dir(config, args.split)
     ensure_dir(output_dir)
 
     log = setup_logging(
@@ -2098,6 +2171,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report["inputs"] = {
         "candidates": scan["source_path"],
         "split": args.split,
+        "population": args.population,
         "sample_fraction": args.sample_fraction,
         "workers": int(args.workers),
         "chunksize": args.chunksize,

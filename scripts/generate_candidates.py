@@ -23,11 +23,13 @@ roughly ``chunk_s1 * avg_candidates * (8 bytes packed + ~60 bytes decoded)``.
     python scripts/generate_candidates.py --blockers exact_name        # force one blocker
     python scripts/generate_candidates.py --workers 32                 # char verification
 
-Outputs (under ``outputs/candidates/``)::
+Outputs (under ``outputs/candidates/``, prefixed by the split so train and test
+never overwrite each other)::
 
-    candidate_pairs.tsv          source1_entity_id, matched_entity_id,
-                                 source, blockers [, char_jaccard] [, token_df]
-    candidate_pairs_stats.json   volume + provenance statistics
+    {split}_candidate_pairs.tsv          source1_entity_id, matched_entity_id,
+                                         source, blockers [, token_df]
+                                         [, char_jaccard] [, dense_cosine]
+    {split}_candidate_pairs_stats.json   volume + provenance statistics
 
 The evidence columns are present only when their blocker is enabled. See
 ``src/blocking.py`` for the blocker registry and the semantics of each blocker.
@@ -47,11 +49,9 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.blocking import (  # noqa: E402
-    BLOCKER_EXACT_NAME,
     EVIDENCE_COLUMNS,
-    KNOWN_BLOCKERS,
-    UNION_BLOCKERS,
     decode_candidates,
+    enabled_blockers,
     evidence_columns_for,
     load_index,
     truncate_per_group,
@@ -99,31 +99,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--name", default="candidate_pairs", help="output file stem")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
-
-
-def enabled_blockers(config: dict, requested: str | None, log: logging.Logger) -> list[str]:
-    """Blockers to run: explicit CLI list, else those enabled in config.
-
-    Always returned in :data:`UNION_BLOCKERS` order, so the run - and the per-pair
-    ``blockers`` provenance string it writes - does not depend on how the list was
-    spelled on the command line.
-
-    An explicit ``--blockers`` list wins even for blockers the config leaves
-    disabled: naming them on the command line is the more specific instruction.
-    """
-    blocking = config.get("blocking", {})
-    if requested:
-        named = [b.strip() for b in requested.split(",") if b.strip()]
-        unknown = [b for b in named if b not in KNOWN_BLOCKERS]
-        if unknown:
-            raise ValueError(f"unknown blocker(s) {unknown}; expected from {KNOWN_BLOCKERS}")
-        return [b for b in UNION_BLOCKERS if b in set(named)]
-
-    active = [b for b in UNION_BLOCKERS if (blocking.get(b, {}) or {}).get("enabled", False)]
-    if active:
-        return active
-    log.warning("no blocker is enabled in config; falling back to %s", BLOCKER_EXACT_NAME)
-    return [BLOCKER_EXACT_NAME]
 
 
 def resolve_verify_workers(config: dict, requested: int | None, log: logging.Logger) -> int:
@@ -188,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     try:
-        blockers = enabled_blockers(config, args.blockers, log)
+        blockers = enabled_blockers(config, args.blockers)
     except ValueError as error:
         log.error("%s", error)
         return 2
@@ -201,10 +176,12 @@ def main(argv: list[str] | None = None) -> int:
     for source in sources:
         for blocker in blockers:
             try:
+                # verify=True: an index built at another cell, on another key field or
+                # from a since-rewritten prepared table is refused, not silently used.
                 index = load_index(
-                    config, args.split, source, blocker, log=log, workers=verify_workers
+                    config, args.split, source, blocker, log=log, workers=verify_workers, verify=True
                 )
-            except (FileNotFoundError, NotImplementedError) as error:
+            except (FileNotFoundError, NotImplementedError, ValueError, ImportError, OSError) as error:
                 log.error("%s", error)
                 return 2
             indexes[(source, blocker)] = index
@@ -226,7 +203,9 @@ def main(argv: list[str] | None = None) -> int:
     if max_candidates:
         log.info("candidate cap per S1: %s", fmt_int(max_candidates))
 
-    output_path = candidates_path(config, args.name)
+    # Split-aware name ({split}_{name}.tsv): a test run can never overwrite the train
+    # candidates. legacy_fallback=False - a writer always writes the new name.
+    output_path = candidates_path(config, args.name, split=args.split, legacy_fallback=False)
     stats_path = output_path.with_name(output_path.stem + "_stats.json")
     log.info("output: %s", output_path)
     evidence_columns = evidence_columns_for(blockers)
@@ -338,6 +317,11 @@ def main(argv: list[str] | None = None) -> int:
             log_memory(log, f"chunk done, {fmt_int(total_pairs)} pairs so far")
 
     # ---- finalize ---------------------------------------------------------
+    if not partial_path.is_file():
+        # No chunk produced a pair, so the writer never opened the file. Emit the
+        # header-only file: "no candidates" is a valid result, not a crash.
+        header = ["source1_entity_id", "matched_entity_id", "source", "blockers", *evidence_columns]
+        ChunkWriter(partial_path, compression=compression).append_header(header)
     written = _count_rows(partial_path)
     if written != total_pairs:
         log.error("integrity check failed: wrote %s rows, file has %s", fmt_int(total_pairs), fmt_int(written))

@@ -247,7 +247,7 @@ def test_fixture_entities_are_in_the_val_split():
 # Schema
 # ---------------------------------------------------------------------------
 def test_feature_columns_match_the_extractor_exactly():
-    """The 27 features must match the extractor's declaration in name AND order.
+    """The 29 features must match the extractor's declaration in name AND order.
 
     The extractor is parsed, not imported, so this stays a pure schema check. A
     reordering here would silently train every model on a permuted matrix while
@@ -302,7 +302,7 @@ def test_feature_columns_match_the_extractor_exactly():
         "FEATURE_COLUMNS drifted from the extractor:\n"
         f"  extractor: {expected}\n  matcher:   {list(FEATURE_COLUMNS)}"
     )
-    assert len(FEATURE_COLUMNS) == 27, f"expected 27 features, got {len(FEATURE_COLUMNS)}"
+    assert len(FEATURE_COLUMNS) == 29, f"expected 29 features, got {len(FEATURE_COLUMNS)}"
     for name in FEATURE_COLUMNS:
         assert FEATURE_DTYPES[name] == declared[name], (
             f"dtype for {name!r}: matcher says {FEATURE_DTYPES[name]!r}, "
@@ -373,7 +373,7 @@ def test_labels_owners_and_sources_align_row_for_row():
     assert report["n_s1_entities_with_rows"] == 4
     # Rows belonging to the one entity with no true match (S1-16's two rows).
     assert report["rows_for_entities_with_no_true_match"] == 2
-    assert report["n_features"] == 27
+    assert report["n_features"] == 29
 
 
 def test_blank_evidence_reaches_the_matrix_as_nan_not_zero():
@@ -383,7 +383,7 @@ def test_blank_evidence_reaches_the_matrix_as_nan_not_zero():
     column = list(FEATURE_COLUMNS).index("token_df")
 
     assert matrix.dtype == np.float32
-    assert matrix.shape == (len(FEATURE_ROWS), 27)
+    assert matrix.shape == (len(FEATURE_ROWS), 29)
     assert matrix[0, column] == np.float32(42.0), "a present token_df must survive parsing"
     for row in (1, 2, 3):
         assert np.isnan(matrix[row, column]), (
@@ -423,7 +423,7 @@ def test_rows_with_an_unknown_s1_id_are_dropped_counted_and_kept_aligned(tmp_pat
     assert report["rows_dropped_unknown_s1_examples"] == ["S1-999"]
     assert report["rows_labelled"] == len(FEATURE_ROWS)
     assert len(labels) == len(owners) == len(FEATURE_ROWS)
-    assert matrix.shape == (len(FEATURE_ROWS), 27)
+    assert matrix.shape == (len(FEATURE_ROWS), 29)
     # The labels after the injected row are the same as without it - no off-by-one.
     assert np.array_equal(labels, EXPECTED_LABELS)
     assert np.array_equal(owners, EXPECTED_OWNERS)

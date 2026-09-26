@@ -228,6 +228,9 @@ class _Fixture:
         """
         argv = ["--config", str(self.config_path), "--split", "train",
                 "--output-dir", str(out_dir or self.out)]
+        # These tests pin the val-only de-risk sample, so they ask for it explicitly;
+        # the CLI default is now every labelled entity (see the population tests).
+        overrides.setdefault("population", "val")
         for key, value in overrides.items():
             flag = f"--{key.replace('_', '-')}"
             if value is True:
@@ -362,21 +365,60 @@ def test_first_token_hand_computed():
 
 
 def test_parse_provenance_hand_computed():
-    assert epf.parse_provenance("source2:exact_name") == (1, 0, 0, 1, 0)
-    assert epf.parse_provenance("source2:token") == (0, 1, 0, 1, 0)
-    assert epf.parse_provenance("source3:char_ngram") == (0, 0, 1, 1, 0)
-    assert epf.parse_provenance("source2:exact_name,source2:token") == (1, 1, 0, 2, 0)
-    assert epf.parse_provenance("source2:exact_name,source2:token,source3:char_ngram") == (1, 1, 1, 3, 0)
-    assert epf.parse_provenance("") == (0, 0, 0, 0, 0)
+    # (exact, token, char, dense, n_blockers, unknown)
+    assert epf.parse_provenance("source2:exact_name") == (1, 0, 0, 0, 1, 0)
+    assert epf.parse_provenance("source2:token") == (0, 1, 0, 0, 1, 0)
+    assert epf.parse_provenance("source3:char_ngram") == (0, 0, 1, 0, 1, 0)
+    assert epf.parse_provenance("source2:dense") == (0, 0, 0, 1, 1, 0)
+    assert epf.parse_provenance("source2:exact_name,source2:token") == (1, 1, 0, 0, 2, 0)
+    assert epf.parse_provenance("source2:exact_name,source2:token,source3:char_ngram") == (1, 1, 1, 0, 3, 0)
+    assert epf.parse_provenance("source2:char_ngram,source2:dense") == (0, 0, 1, 1, 2, 0)
+    assert epf.parse_provenance("") == (0, 0, 0, 0, 0, 0)
     # An unrecognised label is counted, never silently dropped.
-    assert epf.parse_provenance("source2:levenshtein") == (0, 0, 0, 0, 1)
+    assert epf.parse_provenance("source2:levenshtein") == (0, 0, 0, 0, 0, 1)
     # The label after the LAST ":" identifies the blocker, whatever the source.
-    assert epf.parse_provenance("source3:token") == (0, 1, 0, 1, 0)
+    assert epf.parse_provenance("source3:token") == (0, 1, 0, 0, 1, 0)
 
 
 def test_evidence_columns_follow_the_union():
     assert list(epf.EVIDENCE_FLOAT_COLUMNS) == list(epf.evidence_columns_for(epf.UNION_BLOCKERS))
-    assert set(epf.EVIDENCE_FLOAT_COLUMNS) == {"token_df", "char_jaccard"}
+    assert set(epf.EVIDENCE_FLOAT_COLUMNS) == {"token_df", "char_jaccard", "dense_cosine"}
+
+
+def test_population_all_samples_every_entity_not_only_val():
+    """H1: the default train population is every labelled entity."""
+    fixture = _fixture()
+    try:
+        code, report = fixture.run(sample_fraction=1.0, population="all")
+        assert code == 0
+        sampled = set(fixture.sample()[epf.CANDIDATE_S1_COLUMN])
+        in_file = set(_candidate_frame(fixture.root)[epf.CANDIDATE_S1_COLUMN])
+        assert sampled == in_file
+        assert sampled - _val_ids(), "population=all must reach beyond the val split"
+        assert report["inputs"]["population"] == "all"
+    finally:
+        fixture.close()
+
+
+def test_default_population_is_all_and_test_split_is_forced_to_all():
+    """C2: --split test used to keep only val-hashed ids (~20% of the entities)."""
+    assert epf.parse_args(["--split", "train"]).population == "all"
+    assert epf.parse_args(["--split", "test", "--sample-fraction", "1.0"]).population == "all"
+    mask = epf._sample_mask_for_ids(
+        np.array([f"S1-{i}" for i in range(N_S1)], dtype=object), {}, {}, 1_000_000,
+        logging.getLogger("t"), population="all",
+    )
+    assert mask.all(), "population=all at fraction 1.0 must keep every entity"
+    for argv in (
+        ["--split", "test", "--sample-fraction", "1.0", "--population", "val"],
+        ["--split", "test", "--sample-fraction", "0.5"],
+    ):
+        try:
+            epf.parse_args(argv)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"{argv} must be rejected: it would drop test entities")
 
 
 def test_unit_interval_guard_excludes_the_document_frequency():
@@ -941,7 +983,8 @@ def test_subsample_is_a_subset_of_the_full_sample():
         fixture.run(sample_fraction=1.0)
         small_out = fixture.root / "out_small"
         epf.main(["--config", str(fixture.config_path), "--split", "train",
-                  "--sample-fraction", "0.30", "--output-dir", str(small_out)])
+                  "--sample-fraction", "0.30", "--population", "val",
+                  "--output-dir", str(small_out)])
         small = pd.read_csv(small_out / "sample_candidates.tsv", sep="\t", dtype=str)
         whole = fixture.sample()
         assert 0 < len(small) < len(whole)

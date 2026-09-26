@@ -46,22 +46,13 @@ psutil>=5.9
 # stages still work without it, but the matcher's feature set does not.
 rapidfuzz>=3.6
 
-# Gradient-boosted trees for the match classifier. Permissive licence (MIT).
-# CPU by default: for ~20 features the GPU histogram path often loses to a
-# well-threaded CPU build, so benchmark device=cuda before enabling it.
-# scikit-learn>=1.3
-# lightgbm>=4.0
+# Gradient-boosted trees for the match classifier (scripts/train_model.py's
+# default --model lightgbm). Permissive licences (MIT / BSD). CPU by default: for
+# ~30 features the GPU histogram path often loses to a well-threaded CPU build,
+# so benchmark device=cuda before enabling it. scikit-learn provides GroupKFold.
+scikit-learn>=1.3
+lightgbm>=4.0
 
-# Multilingual embeddings + transformer stages. The device is resolved
-# automatically - CUDA when available, CPU otherwise (CPU works but is slow).
-# Encoder weights must satisfy the challenge's licence and <=8B-parameter
-# constraints; record the chosen checkpoint in src/features.py.
-# torch>=2.1
-# transformers>=4.40
-# sentence-transformers>=2.7
-
-# Dense retrieval index (only if FAISS beats exact search at this scale).
-# GPU note: exact search needs the whole index resident in VRAM - ~15.8GB for
-# 10.3M x 384-dim vectors in float32, ~7.9GB in float16 - so a 16GB card needs
-# fp16, sharding, or an IVF/PQ index rather than a flat index.
-# faiss-cpu>=1.7  ; or faiss-gpu on a CUDA node
+# The dense blocker (bge-m3 + FAISS) has its own file, because torch must be
+# installed to match the node's CUDA version:
+#   pip install -r requirements-dense.txt

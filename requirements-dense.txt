@@ -1,0 +1,24 @@
+# Dense blocker dependencies (blocking.dense): BAAI/bge-m3 embeddings + FAISS.
+#
+# Only needed when the dense blocker is enabled. Install torch FIRST, matched to
+# the node - otherwise pip may pull a CUDA build a CPU node cannot use, or vice
+# versa:
+#   CPU:  pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu124   # match `nvidia-smi`
+# then:
+#   pip install -r requirements-dense.txt
+#
+# The model itself is fetched once, on a node with internet, and loaded offline:
+#   python scripts/fetch_dense_model.py --output /scratch/$USER/models/bge-m3 --verify
+#
+# Model: BAAI/bge-m3 - MIT licence, ~568M parameters (well inside the challenge's
+# parameter limit), 1024-dim, 100+ languages.
+#
+# VRAM / RAM for a Flat index: 10.3M x 1024 dims is ~42 GB in float32 and ~21 GB
+# in float16 across both target sources - so on a 16-40 GB card use per-source
+# indexes with fp16 (faiss-gpu), or an IVF/HNSW factory (blocking.dense.faiss_factory).
+torch>=2.6
+sentence-transformers>=3.0
+transformers>=4.40
+huggingface_hub>=0.23
+faiss-cpu>=1.8      # faiss-gpu on a CUDA node

@@ -22,6 +22,7 @@ Typical use::
 
 from __future__ import annotations
 
+import csv
 import logging
 import os
 from pathlib import Path
@@ -57,6 +58,20 @@ SPLITS = ("train", "test")
 ENV_DATA_ROOT = "ER_DATA_ROOT"
 ENV_TEST_DATA_ROOT = "ER_TEST_DATA_ROOT"
 ENV_WORK_DIR = "ER_WORK_DIR"
+
+# Strict TSV: a double quote is an ordinary character, never a field delimiter.
+# Pandas' default (QUOTE_MINIMAL on '"') lets a business name that *starts* with an
+# unmatched quote swallow the tabs and newlines after it, merging rows silently.
+# The challenge files are plain tab-separated text, so no field can legitimately
+# contain a tab or a newline and nothing ever needs quoting.
+TSV_QUOTING = csv.QUOTE_NONE
+# Recorded in every prepared-table sidecar, so a table written under the old
+# quoting rule is detected as stale rather than read under the new one.
+TSV_DIALECT = "tab/quote-none"
+
+# Legacy candidate file name, from before candidate files were split-aware. Only
+# ever *read* (for train), so existing HPC artifacts stay usable.
+LEGACY_CANDIDATES_STEM = "candidate_pairs"
 
 
 # ---------------------------------------------------------------------------
@@ -179,10 +194,38 @@ def prepared_path(config: dict, split: str, source: str) -> Path:
     return config["resolved"]["prepared_dir"] / f"{split}_{source}_norm{suffix}"
 
 
-def candidates_path(config: dict, name: str = "candidate_pairs") -> Path:
-    """Absolute path for a candidate-pairs output file."""
+def candidates_path(
+    config: dict,
+    name: str = "candidate_pairs",
+    split: str = "train",
+    legacy_fallback: bool = True,
+) -> Path:
+    """Absolute path for a candidate-pairs file of one split: ``{split}_{name}.tsv``.
+
+    The split is part of the name so a test run can never overwrite the train
+    candidates (they used to share ``candidate_pairs.tsv``).
+
+    Args:
+        name: file stem.
+        split: ``train`` or ``test``.
+        legacy_fallback: for **readers** only. When the split-aware train file does
+            not exist but a pre-split-aware ``{name}.tsv`` does, return that one, so
+            candidate files generated before this change stay readable. Writers pass
+            ``False`` so they always write the split-aware name.
+    """
+    if split not in SPLITS:
+        raise ValueError(f"unknown split {split!r}; expected one of {SPLITS}")
     suffix = ".parquet" if config.get("io", {}).get("candidates_format") == "parquet" else ".tsv"
-    return config["resolved"]["candidates_dir"] / f"{name}{suffix}"
+    directory = Path(config["resolved"]["candidates_dir"])
+    path = directory / f"{split}_{name}{suffix}"
+    if legacy_fallback and split == "train" and not path.is_file():
+        legacy = directory / f"{name}{suffix}"
+        if legacy.is_file():
+            logger.warning(
+                "reading legacy candidate file %s (split-aware name %s not found)", legacy, path.name
+            )
+            return legacy
+    return path
 
 
 def require_file(path: Path, hint: str = "") -> Path:
@@ -256,6 +299,7 @@ def iter_tsv(
         "dtype": str,
         "keep_default_na": False,
         "na_filter": False,
+        "quoting": TSV_QUOTING,
         "chunksize": chunksize,
         "compression": _compression_for(path),
         "on_bad_lines": "warn",
@@ -279,6 +323,7 @@ def read_tsv(
         "dtype": str,
         "keep_default_na": False,
         "na_filter": False,
+        "quoting": TSV_QUOTING,
         "compression": _compression_for(path),
         "on_bad_lines": "warn",
     }
@@ -322,6 +367,29 @@ def count_rows(path: str | os.PathLike) -> int:
     return total
 
 
+def count_data_lines(path: str | os.PathLike) -> int:
+    """Non-blank physical lines after the header, by a byte scan (no parsing).
+
+    The independent check on the parser: under strict TSV every non-blank line is
+    exactly one record, so ``parsed rows != count_data_lines`` means rows were
+    merged, split or dropped (``on_bad_lines`` only *warns*). Blank lines are not
+    counted because pandas skips them too.
+    """
+    import gzip
+
+    path = Path(path)
+    opener = gzip.open if path.suffix == ".gz" else open
+    count = 0
+    with opener(path, "rb") as handle:
+        header = handle.readline()
+        if not header:
+            return 0
+        for line in handle:
+            if line.strip(b"\r\n"):
+                count += 1
+    return count
+
+
 class ChunkWriter:
     """Append DataFrame chunks to one TSV (optionally compressed).
 
@@ -345,6 +413,9 @@ class ChunkWriter:
         """Write a chunk. Returns the number of rows written."""
         if frame is None or len(frame) == 0:
             return 0
+        # QUOTE_NONE: fields are written verbatim, so a literal '"' round-trips as
+        # itself. A field containing a tab or newline cannot be represented in strict
+        # TSV and makes the csv writer raise - loudly, rather than corrupting a row.
         frame.to_csv(
             self.path,
             sep="\t",
@@ -353,9 +424,25 @@ class ChunkWriter:
             mode="w" if not self._wrote_header else "a",
             compression=self.compression,
             encoding="utf-8",
+            quoting=TSV_QUOTING,
         )
         self._wrote_header = True
         return len(frame)
+
+    def append_header(self, columns: Sequence[str]) -> None:
+        """Write a header-only file (a valid, empty table) if nothing was written yet."""
+        if self._wrote_header:
+            return
+        pd.DataFrame(columns=list(columns)).to_csv(
+            self.path,
+            sep="\t",
+            index=False,
+            mode="w",
+            compression=self.compression,
+            encoding="utf-8",
+            quoting=TSV_QUOTING,
+        )
+        self._wrote_header = True
 
     def __enter__(self) -> "ChunkWriter":
         return self

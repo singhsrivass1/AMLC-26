@@ -118,7 +118,10 @@ def main(argv: list[str] | None = None) -> int:
     k_values = config.get("evaluation", {}).get("k_values", [10, 25, 50, 100, 200])
     evaluator = CandidateEvaluation(ground_truth, n_target_records=n_targets, k_values=k_values, log=log)
 
-    candidate_file = candidates_path(config, args.candidates)
+    if args.split_candidates != "train":
+        log.error("only train candidates can be scored: the ground truth covers the train split only")
+        return 2
+    candidate_file = candidates_path(config, args.candidates, split=args.split_candidates)
     started = time.time()
     metrics_all = evaluator.evaluate_file(candidate_file, chunksize=args.chunksize, max_rows=args.limit_rows)
     elapsed = time.time() - started

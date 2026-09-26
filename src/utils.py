@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover
 
 _LOG_FORMAT = "%(asctime)s | %(levelname)-7s | %(name)-22s | %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+_OWNED_HANDLER_FLAG = "_er_setup_logging"
 
 
 def setup_logging(
@@ -67,12 +68,16 @@ def setup_logging(
     logger.setLevel(level)
     logger.propagate = False
 
-    if logger.handlers:
+    # Idempotent on OUR handlers only. A handler someone else attached (pytest's
+    # LogCaptureHandler, an embedding application's) must not count as "already
+    # configured", or the run silently writes no log file.
+    if any(getattr(handler, _OWNED_HANDLER_FLAG, False) for handler in logger.handlers):
         return logger
 
     formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
     stream_handler = logging.StreamHandler(sys.stderr)
     stream_handler.setFormatter(formatter)
+    setattr(stream_handler, _OWNED_HANDLER_FLAG, True)
     logger.addHandler(stream_handler)
 
     if log_dir is not None:
@@ -81,6 +86,7 @@ def setup_logging(
         target = directory / (log_file or f"{name}.log")
         file_handler = logging.FileHandler(target, encoding="utf-8")
         file_handler.setFormatter(formatter)
+        setattr(file_handler, _OWNED_HANDLER_FLAG, True)
         logger.addHandler(file_handler)
 
     return logger

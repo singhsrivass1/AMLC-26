@@ -58,6 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.data_loader import describe_environment, load_config  # noqa: E402
 from src.matching_model import (  # noqa: E402
     DEFAULT_FOLDS,
+    FEATURE_COLUMNS,
     FOLD_MODES,
     MODEL_LIGHTGBM,
     MODELS,
@@ -79,7 +80,7 @@ FEATURES_SUBDIR = Path("experiments") / "step3_features" / "features.tsv"
 
 HOW_TO_BUILD_FEATURES = (
     "Build it first (the feature file is the matcher's input of record):\n"
-    "  python scripts/extract_pair_features.py --sample-fraction 1.0 --split train\n"
+    "  python scripts/extract_pair_features.py --split train --population all --sample-fraction 1.0\n"
     "Then point this script at the result:\n"
     "  python scripts/train_model.py --features <that output>/features.tsv"
 )
@@ -235,7 +236,7 @@ def plan_memory(log, features_path: Path, sample_rows: int | None, model: str) -
     )
     log.info(
         "      one fold's training copy is ~%s, released before the next fold starts",
-        human_bytes(int(rows * 27 * 4 * 4 / 5)),
+        human_bytes(int(rows * len(FEATURE_COLUMNS) * 4 * 4 / 5)),
     )
 
 

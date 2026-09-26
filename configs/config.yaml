@@ -171,10 +171,36 @@ blocking:
     # Inclusive trigram Jaccard cut-off applied to every retrieved pair.
     jaccard: 0.3
 
-  # ---- Roadmap: implemented in later milestones, disabled for now ----
-  tfidf:
-    enabled: false
+  # ---- Dense multilingual retrieval (implemented; NOT yet calibrated) ----
+  # bge-m3 embeddings of name_norm + FAISS inner-product search: each S1 keeps its
+  # top_k nearest targets with cosine >= min_score. This is the generator for the
+  # cross-script pairs (134,718 in train) no lexical blocker can reach.
+  #
+  # Disabled until the HPC recall x volume run picks top_k / min_score, the same
+  # way the lexical cells were calibrated. To enable: fetch the model once on a
+  # node with internet (python scripts/fetch_dense_model.py --output <dir>), set
+  # model_name_or_path to <dir>, then either flip enabled or pass
+  # --blockers exact_name,token,char_ngram,dense to build_indexes/generate_candidates.
+  # Encoding ~12.6M names is the GPU stage of the pipeline (compute.device).
   dense:
+    enabled: false
+    key: "name_norm"
+    model_name_or_path: "BAAI/bge-m3"  # a LOCAL directory in production
+    backend: "sentence_transformers"
+    local_files_only: true             # never reach the hub at runtime
+    max_length: 64
+    batch_size: 256
+    device: "auto"                     # auto -> compute.device
+    faiss_factory: "Flat"              # exact; e.g. "IVF16384,Flat" at full scale
+    nprobe: 32                         # IVF factories only
+    train_sample: 500000               # IVF training vectors
+    top_k: 20
+    # Recall-first: true cross-script pairs score ~0.67-0.84 (synthetic smoke test),
+    # so 0.75 would drop most of them. Calibrate on the HPC recall x volume run.
+    min_score: 0.60
+
+  # ---- Roadmap ----
+  tfidf:
     enabled: false
 
   # Safety valve: cap candidates per (S1, source). 0 = unlimited.

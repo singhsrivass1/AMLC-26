@@ -10,12 +10,24 @@ Memory is estimated and logged **before** the build starts, because the build
 stage is the one that holds accumulators for a whole source (unlike the
 streaming stages).
 
-    python scripts/build_indexes.py
+    python scripts/build_indexes.py                                    # every blocker enabled in config
+    python scripts/build_indexes.py --split test                       # the test-split indexes
+    python scripts/build_indexes.py --blockers dense                   # one blocker only
     python scripts/build_indexes.py --sources source2 --limit 500000   # smoke test
     python scripts/build_indexes.py --overwrite                        # force rebuild
 
-Outputs: ``outputs/indexes/{split}_{source}_{blocker}/`` with flat .npy arrays,
-the key blob, and meta.json (format version, counts, key field).
+By default the blockers built are the ones enabled in ``config.yaml`` - the same
+set ``generate_candidates.py`` loads - so the documented full run cannot stop at
+stage 3 on a missing index.
+
+An existing index is reused only when its build record (row limit, blocker cell,
+key field, prepared-table size/mtime) matches this run. A smoke-test index built
+with ``--limit`` is therefore rebuilt by a later full run instead of silently
+standing in for the full corpus.
+
+Outputs: ``outputs/indexes/{split}_{source}_{blocker}/`` with flat .npy arrays
+(or, for ``dense``, the FAISS index and the float16 embeddings), and meta.json
+(format version, counts, key field, build record).
 """
 
 from __future__ import annotations
@@ -29,9 +41,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.blocking import (  # noqa: E402
-    BLOCKER_EXACT_NAME,
     KNOWN_BLOCKERS,
     build_index,
+    enabled_blockers,
     index_dir_for,
 )
 from src.data_loader import (  # noqa: E402
@@ -117,7 +129,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--work-dir", default=None)
     parser.add_argument("--split", default="train", choices=["train", "test"])
     parser.add_argument("--sources", default=",".join(TARGET_SOURCES))
-    parser.add_argument("--blockers", default=BLOCKER_EXACT_NAME, help=f"comma-separated from {KNOWN_BLOCKERS}")
+    parser.add_argument(
+        "--blockers",
+        default=None,
+        help=f"comma-separated from {KNOWN_BLOCKERS}. Default: the blockers enabled in "
+        "config - the same set generate_candidates.py will load",
+    )
     parser.add_argument("--limit", type=int, default=None, help="max rows per source (smoke tests)")
     parser.add_argument("--overwrite", action="store_true", help="rebuild even if a valid index exists")
     parser.add_argument("--log-level", default="INFO")
@@ -142,11 +159,12 @@ def main(argv: list[str] | None = None) -> int:
     log.info("=" * 78)
 
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
-    blockers = [b.strip() for b in args.blockers.split(",") if b.strip()]
-    for blocker in blockers:
-        if blocker not in KNOWN_BLOCKERS:
-            log.error("unknown blocker %r; expected one of %s", blocker, KNOWN_BLOCKERS)
-            return 2
+    try:
+        blockers = enabled_blockers(config, args.blockers)
+    except ValueError as error:
+        log.error("%s", error)
+        return 2
+    log.info("blockers: %s%s", ", ".join(blockers), "" if args.blockers else " (enabled in config)")
     for source in sources:
         if source not in TARGET_SOURCES:
             log.error("indexes are built for %s, got %r", TARGET_SOURCES, source)
