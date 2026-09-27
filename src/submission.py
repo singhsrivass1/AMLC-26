@@ -122,6 +122,42 @@ def load_s1_universe(config: dict, split: str, log: Optional[logging.Logger] = N
 # ---------------------------------------------------------------------------
 # Target conflicts: one S2/S3 record, several S1 claimants
 # ---------------------------------------------------------------------------
+def best_claim_mask(
+    target_codes: np.ndarray,
+    scores: np.ndarray,
+    tiebreak: np.ndarray,
+    return_order: bool = False,
+):
+    """For each target, keep the one row with the highest score (ties: lowest ``tiebreak``).
+
+    This IS the greedy global assignment - sort every prediction by score descending
+    and give each target to its first claimant, dropping later claims - because only
+    the target side is capacity-limited (an S1 may keep many targets). The greedy
+    walk therefore never has a reason to skip a target's best claim, and "first
+    claimant in descending order" is exactly "argmax per target". Computed with one
+    ``lexsort`` over integer arrays, so it scales to hundreds of millions of rows.
+
+    Threshold order is irrelevant: a target's best claim passes a cut-off iff any of
+    its claims does, so thresholding before or after this mask selects the same rows.
+
+    Returns:
+        the boolean keep mask (and, with ``return_order``, the sort order and the
+        first-of-target flags in that order, for callers that need tie statistics).
+    """
+    target_codes = np.asarray(target_codes)
+    scores = np.asarray(scores, dtype=np.float64)
+    keep = np.zeros(len(target_codes), dtype=bool)
+    if len(target_codes) == 0:
+        return (keep, np.empty(0, dtype=np.int64), np.empty(0, dtype=bool)) if return_order else keep
+    # Primary key target, then score descending, then the tie-break ascending.
+    order = np.lexsort((np.asarray(tiebreak), -scores, target_codes))
+    sorted_codes = target_codes[order]
+    first = np.ones(len(order), dtype=bool)
+    first[1:] = sorted_codes[1:] != sorted_codes[:-1]
+    keep[order[first]] = True
+    return (keep, order, first) if return_order else keep
+
+
 def resolve_target_conflicts(
     s1_ids: Sequence[str],
     target_ids: Sequence[str],
@@ -172,12 +208,7 @@ def resolve_target_conflicts(
 
     target_codes, target_uniques = pd.factorize(targets, sort=False)
     s1_rank = np.fromiter((s1_order[value] for value in s1), dtype=np.int64, count=n)
-    # Primary key target, then score descending, then S1 file order.
-    order = np.lexsort((s1_rank, -score, target_codes))
-    sorted_codes = target_codes[order]
-    first = np.ones(n, dtype=bool)
-    first[1:] = sorted_codes[1:] != sorted_codes[:-1]
-    keep[order[first]] = True
+    keep, order, first = best_claim_mask(target_codes, score, s1_rank, return_order=True)
 
     # A pair duplicated in the input would count as a conflict with itself; it is
     # not one, so claimants are counted as distinct S1 ids per target.

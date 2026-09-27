@@ -44,10 +44,12 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.data_loader import (  # noqa: E402
+    ChunkWriter,
     describe_environment,
     load_config,
     load_ground_truth,
@@ -75,6 +77,7 @@ from src.submission import (  # noqa: E402
 from src.utils import fmt_int, read_json, setup_logging, write_json  # noqa: E402
 
 LOG_NAME = "predict"
+SCORE_COLUMN = "probability"
 CANDIDATE_S1_COLUMN, CANDIDATE_TARGET_COLUMN = ID_COLUMNS[0], ID_COLUMNS[1]
 
 
@@ -107,8 +110,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--allow-partial-features", action="store_true",
                         help="accept a feature file from a sampled/limited extraction (smoke tests only)")
+    parser.add_argument("--scores-out", default=None,
+                        help="also write every pair's RAW model score (before threshold and conflict "
+                        "resolution) to this TSV, for scripts/resolve_conflicts.py. 'auto' = "
+                        "<work_dir>/submission/{split}_scores.tsv")
+    parser.add_argument("--scores-floor", type=float, default=0.01,
+                        help="omit pairs scoring below this from --scores-out (keeps the file small; "
+                        "resolve_conflicts.py refuses thresholds below it)")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
+
+
+def scores_meta_path(scores_path: Path) -> Path:
+    """The sidecar recording how a --scores-out file was made (floor, model, split)."""
+    return scores_path.with_name(scores_path.name + ".meta.json")
 
 
 def default_paths(config: dict, args: argparse.Namespace) -> tuple[Path, Path, Path]:
@@ -201,6 +216,14 @@ def main(argv: list[str] | None = None) -> int:
         log.error("feature file lacks columns the model needs: %s", missing)
         return 2
 
+    scores_path = None
+    scores_writer = None
+    scores_rows = 0
+    if args.scores_out:
+        scores_path = (Path(config["resolved"]["work_dir"]) / "submission" / f"{args.split}_scores.tsv"
+                       if args.scores_out == "auto" else Path(args.scores_out).expanduser().resolve())
+        scores_writer = ChunkWriter(scores_path.with_name(scores_path.name + ".partial"))
+
     started = time.time()
     kept_s1: list[np.ndarray] = []
     kept_targets: list[np.ndarray] = []
@@ -219,6 +242,13 @@ def main(argv: list[str] | None = None) -> int:
         probabilities = predict(config, bundle, chunk[list(bundle.feature_columns)])
         decisions = decide(config, bundle, probabilities)
         targets = chunk[CANDIDATE_TARGET_COLUMN].to_numpy(dtype=object)
+        if scores_writer is not None:
+            above = np.asarray(probabilities) >= args.scores_floor
+            scores_rows += scores_writer.append(pd.DataFrame({
+                CANDIDATE_S1_COLUMN: s1_ids[above],
+                CANDIDATE_TARGET_COLUMN: targets[above],
+                SCORE_COLUMN: np.char.mod("%.8f", np.asarray(probabilities, dtype=np.float64)[above]),
+            }))
         kept_s1.append(s1_ids[decisions])
         kept_targets.append(targets[decisions])
         kept_scores.append(np.asarray(probabilities, dtype=np.float64)[decisions])
@@ -226,6 +256,16 @@ def main(argv: list[str] | None = None) -> int:
         kept += int(decisions.sum())
     log.info("scored %s candidate rows in %.1f s; %s at or above the threshold",
              fmt_int(rows), time.time() - started, fmt_int(kept))
+    if scores_writer is not None:
+        if scores_rows == 0:
+            scores_writer.append_header([CANDIDATE_S1_COLUMN, CANDIDATE_TARGET_COLUMN, SCORE_COLUMN])
+        scores_writer.path.replace(scores_path)
+        write_json(scores_meta_path(scores_path), {
+            "split": args.split, "model_dir": str(model_dir), "model": bundle.model,
+            "bundle_threshold": float(bundle.threshold), "floor": float(args.scores_floor),
+            "features": str(features_path), "feature_rows_scored": rows, "rows_written": scores_rows,
+        })
+        log.info("raw scores: %s pairs >= %s -> %s", fmt_int(scores_rows), args.scores_floor, scores_path)
 
     pair_s1 = np.concatenate(kept_s1) if kept_s1 else np.empty(0, dtype=object)
     pair_targets = np.concatenate(kept_targets) if kept_targets else np.empty(0, dtype=object)

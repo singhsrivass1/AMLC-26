@@ -260,6 +260,18 @@ def run(model_path: Path, root: Path) -> Checks:
     run_stage("predict", ["--split", "train"], config_path, env, stage_logs)
     run_stage("score_submission", [str(work / "submission" / "matching_results.tsv"), "--split", "test"],
               config_path, env, stage_logs)
+    # Raw scores -> resolve_conflicts at the bundle threshold must reproduce predict's
+    # own keep-best submission.
+    run_stage("predict", ["--split", "test", "--scores-out", "auto", "--output",
+                          str(work / "submission" / "scores_run.tsv")], config_path, env, stage_logs)
+    run_stage("resolve_conflicts", ["--split", "test", "--threshold", "bundle"], config_path, env, stage_logs)
+    # The standalone GPU dense generator, unioned into string-only candidates, must
+    # reproduce what generate_candidates wrote with the dense blocker enabled.
+    run_stage("generate_candidates", ["--split", "test", "--blockers", "exact_name,token,char_ngram",
+                                      "--name", "string_only", "--workers", "1"], config_path, env, stage_logs)
+    run_stage("generate_dense_candidates",
+              ["--split", "test", "--devices", "cpu", "--scope", "per-source", "--top-k", "3", "--min-score", "0.45",
+               "--merge-with", str(work / "candidates" / "test_string_only.tsv")], config_path, env, stage_logs)
 
     print("\nchecks:", flush=True)
     # H3: every enabled blocker was built by the default build_indexes invocation.
@@ -294,6 +306,23 @@ def run(model_path: Path, root: Path) -> Checks:
                      only_dense, f"blockers={provenance} dense_cosine={cosine}")
     checks.check(f"C1 {NO_CANDIDATE_SINGLETON} (empty name) has no candidates at all",
                  NO_CANDIDATE_SINGLETON not in set(test_table["source1_entity_id"]))
+
+    resolved = work / "submission" / "resolved" / "matching_results.tsv"
+    checks.check("resolve_conflicts (bundle threshold) reproduces predict's keep-best submission",
+                 resolved.read_bytes() == (work / "submission" / "matching_results.tsv").read_bytes())
+
+    union = read_tsv(work / "candidates" / "test_candidate_pairs_dense_union.tsv")
+    exact_columns = ["source1_entity_id", "matched_entity_id", "source", "blockers", "token_df", "char_jaccard"]
+    cosine_gap = max(
+        (abs(float(a) - float(b)) for a, b in zip(test_table["dense_cosine"], union["dense_cosine"]) if a and b),
+        default=0.0,
+    )
+    checks.check(
+        "GPU dense script + union reproduces generate_candidates' dense blocker",
+        list(union.columns) == list(test_table.columns) and union[exact_columns].equals(test_table[exact_columns])
+        and (union["dense_cosine"] == "").equals(test_table["dense_cosine"] == "") and cosine_gap < 1e-3,
+        f"{len(union)} vs {len(test_table)} rows, max cosine diff {cosine_gap:.5f}",
+    )
 
     # C2: every test S1 with candidates was featurized.
     test_features = read_tsv(work / "experiments" / "step3_features_test" / "features.tsv")
